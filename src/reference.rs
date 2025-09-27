@@ -1,7 +1,9 @@
-use crate::{ActorAddress, ActorError, Message};
+use crate::{ActorAddress, ActorError, Message, AskError};
+use crate::ask::AskRequest;
 use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
@@ -61,15 +63,27 @@ pub enum ActorState {
 
 /// Message envelope for actor communication
 #[derive(Debug)]
-pub struct ActorMessage<M: Message> {
-    /// The actual message
-    pub message: M,
-    /// Sender reference for replies
-    pub sender: Option<ActorRef<M>>,
-    /// Message ID for tracking
-    pub message_id: Uuid,
-    /// Timestamp when message was sent
-    pub timestamp: std::time::SystemTime,
+pub enum ActorMessage<M: Message> {
+    /// Regular tell message
+    Tell {
+        /// The actual message
+        message: M,
+        /// Sender reference for replies
+        sender: Option<ActorRef<M>>,
+        /// Message ID for tracking
+        message_id: Uuid,
+        /// Timestamp when message was sent
+        timestamp: std::time::SystemTime,
+    },
+    /// Ask pattern request message
+    Ask {
+        /// Ask request containing message and response channel
+        request: AskRequest<M>,
+        /// Message ID for tracking
+        message_id: Uuid,
+        /// Timestamp when message was sent
+        timestamp: std::time::SystemTime,
+    },
 }
 
 /// Trait for network transport implementations
@@ -120,7 +134,7 @@ impl<M: Message> ActorRef<M> {
 
     /// Send a message to the actor (fire-and-forget)
     pub async fn tell(&self, message: M, sender: Option<ActorRef<M>>) -> Result<(), ActorError> {
-        let actor_message = ActorMessage {
+        let actor_message = ActorMessage::Tell {
             message,
             sender,
             message_id: Uuid::new_v4(),
@@ -133,17 +147,30 @@ impl<M: Message> ActorRef<M> {
         }
     }
 
+    /// Send an ask request (internal method)
+    pub(crate) async fn tell_ask_request(&self, request: AskRequest<M>) -> Result<(), ActorError> {
+        let actor_message = ActorMessage::Ask {
+            request,
+            message_id: Uuid::new_v4(),
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        match &self.inner {
+            ActorRefInner::Local(local_ref) => local_ref.send(actor_message).await,
+            ActorRefInner::Remote(remote_ref) => remote_ref.send(&self.address, actor_message).await,
+        }
+    }
+
     /// Send a message and wait for a response (ask pattern)
-    pub async fn ask<R>(&self, _message: M, _timeout: std::time::Duration) -> Result<R, ActorError>
+    pub async fn ask<R>(&self, message: M, timeout: Duration) -> Result<R, AskError>
     where
-        R: Message,
+        R: Message + 'static,
         M: Message,
     {
-        // TODO: Implement ask pattern with temporary response actor
-        // This will be implemented in Phase 2 with proper message routing
-        Err(ActorError::MessageDeliveryFailed(
-            "Ask pattern not yet implemented".to_string(),
-        ))
+        // We need a system reference to use the ask function
+        // For now, we'll create a placeholder implementation
+        // This will be properly integrated when we have access to the system
+        crate::ask::ask_with_actor_ref(self, message, timeout).await
     }
 
     /// Check if this reference points to a local actor

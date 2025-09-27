@@ -4,10 +4,22 @@ use std::any::Any;
 
 /// Core trait that all actors must implement
 /// Generic over the message type for type safety
+///
+/// Actors can handle both Tell and Ask messages through the same handle() method.
+/// Use ctx.is_ask_request() to check if a response is expected.
+/// Use ctx.respond() to send responses for Ask messages.
 #[async_trait]
 pub trait Actor<M: Message>: Send + Sync + 'static {
-    /// Handle incoming messages
-    /// This is the main message processing method
+    /// Handle incoming messages (both Tell and Ask)
+    ///
+    /// For Ask messages:
+    /// - Use ctx.is_ask_request() to detect ask requests
+    /// - Use ctx.respond(response) to send responses back
+    /// - Ask messages MUST send a response, or the request will timeout
+    ///
+    /// For Tell messages:
+    /// - Process normally, no response needed
+    /// - ctx.respond() will return an error if called during Tell
     async fn handle(&mut self, msg: M, ctx: &ActorContext<M>) -> Result<(), ActorError>;
 
     /// Called when the actor is starting up

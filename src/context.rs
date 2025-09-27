@@ -1,9 +1,42 @@
 use crate::{Actor, ActorAddress, ActorError, ActorProps, ActorRef, Message, ActorFactoryArgs};
+use crate::ask::ResponseEnvelope;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info};
 use uuid::Uuid;
+
+/// Response capability for ask pattern - embedded in context during ask handling
+pub(crate) struct ResponseCapability {
+    /// Correlation ID for this ask request
+    pub correlation_id: Uuid,
+    /// Channel to send response back
+    sender: mpsc::UnboundedSender<ResponseEnvelope>,
+}
+
+impl ResponseCapability {
+    pub(crate) fn new(correlation_id: Uuid, sender: mpsc::UnboundedSender<ResponseEnvelope>) -> Self {
+        Self {
+            correlation_id,
+            sender,
+        }
+    }
+
+    /// Send a response back through this capability
+    pub(crate) async fn send_response<R: Message + 'static>(&self, response: R) -> Result<(), ActorError> {
+        let envelope = ResponseEnvelope {
+            data: Box::new(response),
+            type_name: std::any::type_name::<R>(),
+            correlation_id: self.correlation_id,
+        };
+
+        self.sender
+            .send(envelope)
+            .map_err(|_| ActorError::MessageDeliveryFailed("Response channel closed".to_string()))?;
+
+        Ok(())
+    }
+}
 
 /// Actor context provides the runtime environment for an actor
 /// This is passed to actors during message handling and lifecycle events
@@ -18,6 +51,8 @@ pub struct ActorContext<M: Message> {
     parent: Option<ActorRef<M>>,
     /// Actor properties and configuration
     props: ActorProps,
+    /// Response capability (only present during ask requests)
+    response_capability: Option<ResponseCapability>,
 }
 
 /// Actor system manages the lifecycle of all actors
@@ -58,7 +93,7 @@ impl Default for ActorSystemConfig {
 }
 
 impl<M: Message> ActorContext<M> {
-    /// Create a new actor context
+    /// Create a new actor context for regular (tell) messages
     pub fn new(
         actor_ref: ActorRef<M>,
         system: Arc<ActorSystem<M>>,
@@ -71,7 +106,47 @@ impl<M: Message> ActorContext<M> {
             children: Arc::new(RwLock::new(HashMap::new())),
             parent,
             props,
+            response_capability: None,
         }
+    }
+
+    /// Create a new actor context with response capability for ask messages
+    pub(crate) fn with_response_capability(
+        actor_ref: ActorRef<M>,
+        system: Arc<ActorSystem<M>>,
+        parent: Option<ActorRef<M>>,
+        props: ActorProps,
+        response_capability: ResponseCapability,
+    ) -> Self {
+        Self {
+            actor_ref,
+            system,
+            children: Arc::new(RwLock::new(HashMap::new())),
+            parent,
+            props,
+            response_capability: Some(response_capability),
+        }
+    }
+
+    /// Send a response back (only works during ask handling)
+    pub async fn respond<R: Message + 'static>(&self, response: R) -> Result<(), ActorError> {
+        if let Some(capability) = &self.response_capability {
+            capability.send_response(response).await
+        } else {
+            Err(ActorError::MessageDeliveryFailed(
+                "Cannot respond: not an ask request".to_string(),
+            ))
+        }
+    }
+
+    /// Check if this is an ask request that expects a response
+    pub fn is_ask_request(&self) -> bool {
+        self.response_capability.is_some()
+    }
+
+    /// Get the correlation ID for the current ask request (if any)
+    pub fn correlation_id(&self) -> Option<Uuid> {
+        self.response_capability.as_ref().map(|cap| cap.correlation_id)
     }
 
     /// Get reference to this actor
@@ -322,7 +397,32 @@ impl<M: Message> ActorSystem<M> {
 
             // Message processing loop
             while let Some(actor_message) = receiver.recv().await {
-                match actor.handle(actor_message.message, &context_arc).await {
+                let (message, context) = match actor_message {
+                    crate::ActorMessage::Tell { message, sender: _, message_id: _, timestamp: _ } => {
+                        // Regular tell message - use context without response capability
+                        (message, context_arc.clone())
+                    }
+                    crate::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
+                        // Ask message - create context with response capability
+                        let response_capability = ResponseCapability::new(
+                            request.correlation_id,
+                            request.response_to.sender,
+                        );
+
+                        let ask_context = Arc::new(ActorContext::with_response_capability(
+                            context_arc.actor_ref.clone(),
+                            context_arc.system.clone(),
+                            context_arc.parent.clone(),
+                            context_arc.props.clone(),
+                            response_capability,
+                        ));
+
+                        (request.message, ask_context)
+                    }
+                };
+
+                // Unified message handling for both Tell and Ask
+                match actor.handle(message, &context).await {
                     Ok(()) => {
                         debug!("Message processed successfully");
                     }
@@ -330,7 +430,7 @@ impl<M: Message> ActorSystem<M> {
                         error!("Message handling failed: {}", e);
 
                         // Apply supervision strategy
-                        let should_restart = actor.on_error(&e, &context_arc).await;
+                        let should_restart = actor.on_error(&e, &context).await;
                         if !should_restart {
                             break;
                         }

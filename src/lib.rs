@@ -6,12 +6,17 @@ pub mod context;
 pub mod reference;
 pub mod address;
 pub mod system;
+pub mod ask;
+
+#[cfg(test)]
+mod ask_integration_test;
 
 pub use actor::*;
 pub use context::*;
 pub use reference::*;
 pub use address::*;
 pub use system::*;
+pub use ask::{ask, ask_with_actor_ref, AskError, AskExt, AskFuture};
 
 /// Core trait that all messages must implement
 /// Messages must be Send + Sync for distributed actors
