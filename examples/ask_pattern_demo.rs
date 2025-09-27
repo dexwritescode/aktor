@@ -15,7 +15,9 @@ impl Message for GetStatus {
 
 #[derive(Debug, Clone)]
 struct Status {
+    #[allow(dead_code)]
     running: bool,
+    #[allow(dead_code)]
     uptime: Duration,
     message_count: u64,
 }
@@ -26,16 +28,7 @@ impl Message for Status {
     }
 }
 
-#[derive(Debug, Clone)]
-struct WorkMessage {
-    task: String,
-}
 
-impl Message for WorkMessage {
-    fn type_id(&self) -> &'static str {
-        "WorkMessage"
-    }
-}
 
 // Example actor that can respond to ask pattern requests
 struct StatusActor {

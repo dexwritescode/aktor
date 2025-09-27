@@ -8,6 +8,9 @@ pub mod address;
 pub mod system;
 pub mod ask;
 
+#[cfg(feature = "test-util")]
+pub mod test_kit;
+
 #[cfg(test)]
 mod ask_integration_test;
 
@@ -17,6 +20,9 @@ pub use reference::*;
 pub use address::*;
 pub use system::*;
 pub use ask::{ask, ask_with_actor_ref, AskError, AskExt, AskFuture};
+
+#[cfg(feature = "test-util")]
+pub use test_kit::*;
 
 /// Core trait that all messages must implement
 /// Messages must be Send + Sync for distributed actors

@@ -29,26 +29,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone)]
-    struct GetStatusMessage;
 
-    impl Message for GetStatusMessage {
-        fn type_id(&self) -> &'static str {
-            "GetStatusMessage"
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    struct StatusResponse {
-        status: String,
-        count: usize,
-    }
-
-    impl Message for StatusResponse {
-        fn type_id(&self) -> &'static str {
-            "StatusResponse"
-        }
-    }
 
     struct EchoActor {
         message_count: usize,
@@ -88,86 +69,6 @@ mod tests {
         }
     }
 
-    // Multi-message actor that can handle different message types
-    #[derive(Debug, Clone)]
-    enum MultiMessage {
-        Echo(EchoMessage),
-        GetStatus(GetStatusMessage),
-    }
-
-    impl Message for MultiMessage {
-        fn type_id(&self) -> &'static str {
-            match self {
-                MultiMessage::Echo(_) => "MultiMessage::Echo",
-                MultiMessage::GetStatus(_) => "MultiMessage::GetStatus",
-            }
-        }
-    }
-
-    struct MultiActor {
-        message_count: usize,
-        echo_count: usize,
-        status_count: usize,
-    }
-
-    impl Default for MultiActor {
-        fn default() -> Self {
-            Self {
-                message_count: 0,
-                echo_count: 0,
-                status_count: 0,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Actor<MultiMessage> for MultiActor {
-        async fn handle(&mut self, msg: MultiMessage, ctx: &ActorContext<MultiMessage>) -> Result<(), ActorError> {
-            self.message_count += 1;
-
-            let response = match &msg {
-                MultiMessage::Echo(echo_msg) => {
-                    self.echo_count += 1;
-                    if ctx.is_ask_request() {
-                        Some(StatusResponse {
-                            status: format!("Echoed: {}", echo_msg.content),
-                            count: self.echo_count,
-                        })
-                    } else {
-                        println!("MultiActor echo: {}", echo_msg.content);
-                        None
-                    }
-                }
-                MultiMessage::GetStatus(_) => {
-                    self.status_count += 1;
-                    if ctx.is_ask_request() {
-                        Some(StatusResponse {
-                            status: "Running".to_string(),
-                            count: self.message_count,
-                        })
-                    } else {
-                        println!("MultiActor status request");
-                        None
-                    }
-                }
-            };
-
-            // Send response if this is an ask request
-            if let Some(response) = response {
-                ctx.respond(response).await?;
-            }
-
-            Ok(())
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
-        }
-    }
 
     #[tokio::test]
     async fn test_ask_basic_functionality() {
