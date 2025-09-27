@@ -1,4 +1,4 @@
-use crate::{Actor, ActorAddress, ActorError, ActorProps, ActorRef, Message};
+use crate::{Actor, ActorAddress, ActorError, ActorProps, ActorRef, Message, ActorFactoryArgs};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -350,6 +350,62 @@ impl<M: Message> ActorSystem<M> {
         Ok(actor_ref)
     }
 
+    /// Create an actor using the default factory (for actors with Default trait)
+    pub async fn actor_of<A>(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<ActorRef<M>, ActorError>
+    where
+        A: Actor<M> + Default + 'static,
+    {
+        let actor = A::default();
+        let props = ActorProps::default();
+        self.spawn_actor(name, actor, props).await
+    }
+
+    /// Create an actor with arguments using ActorFactoryArgs trait
+    pub async fn actor_of_args<A, Args>(
+        self: &Arc<Self>,
+        name: &str,
+        args: Args,
+    ) -> Result<ActorRef<M>, ActorError>
+    where
+        A: ActorFactoryArgs<M, Args> + 'static,
+        Args: Send + 'static,
+    {
+        let actor = A::create_args(args);
+        let props = ActorProps::default();
+        self.spawn_actor(name, actor, props).await
+    }
+
+    /// Create an actor with custom props
+    pub async fn actor_of_props<A>(
+        self: &Arc<Self>,
+        name: &str,
+        props: ActorProps,
+    ) -> Result<ActorRef<M>, ActorError>
+    where
+        A: Actor<M> + Default + 'static,
+    {
+        let actor = A::default();
+        self.spawn_actor(name, actor, props).await
+    }
+
+    /// Create an actor with arguments and custom props
+    pub async fn actor_of_args_props<A, Args>(
+        self: &Arc<Self>,
+        name: &str,
+        args: Args,
+        props: ActorProps,
+    ) -> Result<ActorRef<M>, ActorError>
+    where
+        A: ActorFactoryArgs<M, Args> + 'static,
+        Args: Send + 'static,
+    {
+        let actor = A::create_args(args);
+        self.spawn_actor(name, actor, props).await
+    }
+
     /// Get an actor by address
     pub async fn get_actor(&self, address: &ActorAddress) -> Option<ActorRef<M>> {
         let actors = self.actors.read().await;
@@ -470,5 +526,217 @@ mod tests {
 
         let result = actor_ref.tell(message, None).await;
         assert!(result.is_ok());
+    }
+
+    // Test actor with arguments for factory testing
+    struct ParameterizedActor {
+        name: String,
+        initial_value: i32,
+        messages: Vec<String>,
+    }
+
+    impl ActorFactoryArgs<TestMessage, (String, i32)> for ParameterizedActor {
+        fn create_args(args: (String, i32)) -> Self {
+            Self {
+                name: args.0,
+                initial_value: args.1,
+                messages: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Actor<TestMessage> for ParameterizedActor {
+        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+            self.messages.push(format!("{}: {}", self.name, msg.data));
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_actor_of() {
+        let config = ActorSystemConfig::default();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+
+        // Test actor_of with Default actors
+        let actor_ref = system.actor_of::<TestActor>("test-actor").await.unwrap();
+
+        assert!(actor_ref.is_local());
+        assert_eq!(actor_ref.address().name(), Some("test-actor"));
+
+        // Test that we can send messages
+        let message = TestMessage {
+            data: "factory test".to_string(),
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let result = actor_ref.tell(message, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_actor_of_args() {
+        let config = ActorSystemConfig::default();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+
+        // Test actor_of_args with parameterized actors
+        let args = ("worker".to_string(), 42);
+        let actor_ref = system.actor_of_args::<ParameterizedActor, _>("param-actor", args).await.unwrap();
+
+        assert!(actor_ref.is_local());
+        assert_eq!(actor_ref.address().name(), Some("param-actor"));
+
+        // Test message sending
+        let message = TestMessage {
+            data: "parameterized test".to_string(),
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let result = actor_ref.tell(message, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_actor_factory_traits() {
+        // Test DefaultActorFactory
+        let factory = crate::DefaultActorFactory::<TestActor>::default();
+        let actor = factory.create_actor::<TestMessage>();
+        assert_eq!(actor.received_count, 0);
+
+        // Test ActorFactoryArgs
+        let actor = ParameterizedActor::create_args(("test".to_string(), 100));
+        assert_eq!(actor.name, "test");
+        assert_eq!(actor.initial_value, 100);
+        assert!(actor.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_props_builder() {
+        use crate::SupervisionStrategy;
+
+        // Test Props builder pattern
+        let props = ActorProps::new()
+            .with_mailbox_size(2000)
+            .with_dispatcher("test-dispatcher")
+            .with_supervision(SupervisionStrategy::Restart)
+            .with_restart(5, 120);
+
+        assert_eq!(props.mailbox_size, 2000);
+        assert_eq!(props.dispatcher, Some("test-dispatcher".to_string()));
+        assert_eq!(props.supervision_strategy, SupervisionStrategy::Restart);
+        assert_eq!(props.max_restarts, 5);
+        assert_eq!(props.restart_window_secs, 120);
+        assert!(props.restart_on_failure);
+    }
+
+    #[tokio::test]
+    async fn test_actor_of_props() {
+        let config = ActorSystemConfig::default();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+
+        // Create actor with custom props
+        let props = ActorProps::new()
+            .with_mailbox_size(5000)
+            .with_dispatcher("custom-dispatcher");
+
+        let actor_ref = system.actor_of_props::<TestActor>("props-actor", props).await.unwrap();
+
+        assert!(actor_ref.is_local());
+        assert_eq!(actor_ref.address().name(), Some("props-actor"));
+
+        // Test message sending
+        let message = TestMessage {
+            data: "props test".to_string(),
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let result = actor_ref.tell(message, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_actor_of_args_props() {
+        let config = ActorSystemConfig::default();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+
+        // Create actor with arguments and custom props
+        let args = ("custom-worker".to_string(), 999);
+        let props = ActorProps::new()
+            .with_mailbox_size(3000)
+            .with_supervision(crate::SupervisionStrategy::Restart);
+
+        let actor_ref = system.actor_of_args_props::<ParameterizedActor, _>(
+            "args-props-actor",
+            args,
+            props
+        ).await.unwrap();
+
+        assert!(actor_ref.is_local());
+        assert_eq!(actor_ref.address().name(), Some("args-props-actor"));
+
+        // Test message sending
+        let message = TestMessage {
+            data: "args props test".to_string(),
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let result = actor_ref.tell(message, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_actors_different_factories() {
+        let config = ActorSystemConfig::default();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+
+        // Create multiple actors using different factory methods
+        let default_actor = system.actor_of::<TestActor>("default").await.unwrap();
+        let param_actor = system.actor_of_args::<ParameterizedActor, _>(
+            "parameterized",
+            ("worker-1".to_string(), 10)
+        ).await.unwrap();
+
+        // Verify they're both working
+        assert!(default_actor.is_local());
+        assert!(param_actor.is_local());
+        assert_eq!(default_actor.address().name(), Some("default"));
+        assert_eq!(param_actor.address().name(), Some("parameterized"));
+
+        // Send messages to both
+        let msg1 = TestMessage { data: "msg1".to_string() };
+        let msg2 = TestMessage { data: "msg2".to_string() };
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert!(default_actor.tell(msg1, None).await.is_ok());
+        assert!(param_actor.tell(msg2, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_actor_name_uniqueness() {
+        let config = ActorSystemConfig::default();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+
+        // Create first actor
+        let actor1 = system.actor_of::<TestActor>("unique-name").await.unwrap();
+        assert!(actor1.is_local());
+
+        // Try to create second actor with same name - should fail
+        let result = system.actor_of::<TestActor>("unique-name").await;
+        assert!(result.is_err());
+
+        if let Err(ActorError::ActorCreationFailed(msg)) = result {
+            assert!(msg.contains("Actor already exists"));
+        } else {
+            panic!("Expected ActorCreationFailed error");
+        }
     }
 }

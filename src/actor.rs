@@ -65,37 +65,62 @@ pub enum SupervisionStrategy {
     Resume,
 }
 
-/// Actor factory trait for creating actors with parameters
-pub trait ActorFactory<M: Message>: Send + Sync + 'static {
-    /// The actor type this factory creates
-    type Actor: Actor<M>;
-
-    /// Create a new actor instance
-    fn create(&self) -> Self::Actor;
+/// Factory trait for actors that can be created with arguments
+pub trait ActorFactoryArgs<M: Message, Args: Send + 'static>: Actor<M> + Sized {
+    /// Create actor with arguments
+    fn create_args(args: Args) -> Self;
 }
 
 /// Simple actor factory for actors with Default implementation
+#[derive(Debug)]
 pub struct DefaultActorFactory<A> {
     _phantom: std::marker::PhantomData<A>,
 }
 
-impl<A> Default for DefaultActorFactory<A> {
-    fn default() -> Self {
+impl<A> DefaultActorFactory<A> {
+    pub fn new() -> Self {
         Self {
             _phantom: std::marker::PhantomData,
         }
     }
+
+    pub fn create_actor<M>(&self) -> A
+    where
+        A: Actor<M> + Default,
+        M: Message,
+    {
+        A::default()
+    }
 }
 
-impl<M, A> ActorFactory<M> for DefaultActorFactory<A>
-where
-    M: Message,
-    A: Actor<M> + Default,
-{
-    type Actor = A;
+impl<A> Default for DefaultActorFactory<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    fn create(&self) -> Self::Actor {
-        A::default()
+/// Args-based actor factory
+#[derive(Debug)]
+pub struct ArgsActorFactory<A, Args> {
+    _phantom_actor: std::marker::PhantomData<A>,
+    _phantom_args: std::marker::PhantomData<Args>,
+}
+
+impl<A, Args> ArgsActorFactory<A, Args> {
+    pub fn new() -> Self {
+        Self {
+            _phantom_actor: std::marker::PhantomData,
+            _phantom_args: std::marker::PhantomData,
+        }
+    }
+
+    pub fn create_actor<M>(&self, args: Args) -> A
+    where
+        A: ActorFactoryArgs<M, Args>,
+        M: Message,
+        Args: Send + 'static,
+    {
+        A::create_args(args)
     }
 }
 
@@ -110,23 +135,29 @@ pub struct ActorProps {
     pub max_restarts: u32,
     /// Time window for restart counting (in seconds)
     pub restart_window_secs: u64,
+    /// Mailbox size for this actor
+    pub mailbox_size: usize,
+    /// Dispatcher name for thread pool assignment
+    pub dispatcher: Option<String>,
 }
 
-impl Default for ActorProps {
-    fn default() -> Self {
-        Self {
-            supervision_strategy: SupervisionStrategy::Stop,
-            restart_on_failure: false,
-            max_restarts: 3,
-            restart_window_secs: 60,
-        }
-    }
-}
-
+/// Enhanced ActorProps with builder pattern
 impl ActorProps {
-    /// Create new actor props with default values
+    /// Create new ActorProps
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set mailbox size
+    pub fn with_mailbox_size(mut self, size: usize) -> Self {
+        self.mailbox_size = size;
+        self
+    }
+
+    /// Set dispatcher
+    pub fn with_dispatcher(mut self, dispatcher: impl Into<String>) -> Self {
+        self.dispatcher = Some(dispatcher.into());
+        self
     }
 
     /// Set supervision strategy
@@ -143,6 +174,20 @@ impl ActorProps {
         self
     }
 }
+
+impl Default for ActorProps {
+    fn default() -> Self {
+        Self {
+            supervision_strategy: SupervisionStrategy::Stop,
+            restart_on_failure: false,
+            max_restarts: 3,
+            restart_window_secs: 60,
+            mailbox_size: 1000,
+            dispatcher: None,
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
