@@ -1,5 +1,6 @@
-use crate::{Actor, ActorAddress, ActorError, ActorProps, ActorRef, Message, ActorFactoryArgs};
-use crate::ask::ResponseEnvelope;
+use crate::core::{Actor, ActorError, Message, ActorFactoryArgs, ActorProps};
+use crate::system::ActorAddress;
+use crate::reference::{ActorRef, ResponseEnvelope};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -331,7 +332,7 @@ impl<M: Message> ActorSystem<M> {
     where
         A: Actor<M> + 'static,
     {
-        let path = crate::ActorPath::user(name)
+        let path = crate::system::ActorPath::user(name)
             .map_err(|e| ActorError::ActorCreationFailed(e.to_string()))?;
         let address = ActorAddress::new(&self.node_id, path)
             .map_err(|e| ActorError::ActorCreationFailed(e.to_string()))?;
@@ -391,18 +392,18 @@ impl<M: Message> ActorSystem<M> {
             }
 
             // Update state to running
-            if let Some(crate::ActorState::Starting) = actor_ref_clone.state().await {
+            if let Some(crate::reference::ActorState::Starting) = actor_ref_clone.state().await {
                 // TODO: Update state to Running
             }
 
             // Message processing loop
             while let Some(actor_message) = receiver.recv().await {
                 let (message, context) = match actor_message {
-                    crate::ActorMessage::Tell { message, sender: _, message_id: _, timestamp: _ } => {
+                    crate::reference::ActorMessage::Tell { message, sender: _, message_id: _, timestamp: _ } => {
                         // Regular tell message - use context without response capability
                         (message, context_arc.clone())
                     }
-                    crate::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
+                    crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
                         // Ask message - create context with response capability
                         let response_capability = ResponseCapability::new(
                             request.correlation_id,

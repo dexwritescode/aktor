@@ -1,8 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::*;
     use crate::{Actor, ActorContext, ActorError, ActorSystem, ActorSystemConfig, Message};
-    use crate::ask::{ResponseChannel, AskRequest};
+    use crate::reference::ask::{ResponseChannel, AskRequest};
     use async_trait::async_trait;
     use std::time::Duration;
     use tokio::time::sleep;
