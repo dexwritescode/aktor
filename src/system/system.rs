@@ -48,8 +48,8 @@ impl ActorSystemBuilder {
     }
 
     /// Build the actor system
-    pub fn build<M: crate::Message>(self) -> Result<std::sync::Arc<ActorSystem<M>>, crate::ActorError> {
-        ActorSystem::new(self.config)
+    pub async fn build<M: crate::Message>(self) -> Result<std::sync::Arc<ActorSystem<M>>, crate::ActorError> {
+        ActorSystem::new(self.config).await
     }
 }
 
@@ -79,7 +79,7 @@ mod tests {
             .with_max_actors(50000)
             .with_mailbox_size(500)
             .build()
-            .unwrap();
+            .await.unwrap();
 
         assert_eq!(system.config().max_actors, 50000);
         assert_eq!(system.config().default_mailbox_size, 500);
@@ -92,7 +92,7 @@ mod tests {
             .with_distributed("0.0.0.0:8080".to_string())
             .with_seed_nodes(vec!["node1:8080".to_string(), "node2:8080".to_string()])
             .build()
-            .unwrap();
+            .await.unwrap();
 
         assert!(system.config().distributed);
         assert_eq!(system.config().bind_address, Some("0.0.0.0:8080".to_string()));

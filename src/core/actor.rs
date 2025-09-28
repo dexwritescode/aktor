@@ -1,5 +1,4 @@
 use crate::{ActorContext, ActorError, Message};
-use async_trait::async_trait;
 use std::any::Any;
 
 /// Core trait that all actors must implement
@@ -8,9 +7,10 @@ use std::any::Any;
 /// Actors can handle both Tell and Ask messages through the same handle() method.
 /// Use ctx.is_ask_request() to check if a response is expected.
 /// Use ctx.respond() to send responses for Ask messages.
-#[async_trait]
-pub trait Actor<M: Message>: Send + Sync + 'static {
-    /// Handle incoming messages (both Tell and Ask)
+///
+/// This is a synchronous trait for maximum performance - no async overhead
+pub trait Actor<M: Message>: Send + Sync + std::fmt::Debug + 'static {
+    /// Handle incoming messages synchronously (both Tell and Ask)
     ///
     /// For Ask messages:
     /// - Use ctx.is_ask_request() to detect ask requests
@@ -21,24 +21,24 @@ pub trait Actor<M: Message>: Send + Sync + 'static {
     /// - Process normally, no response needed
     /// - ctx.respond() will return an error if called during Tell
     ///
-    /// Note: This method no longer returns Result - actors handle errors internally
-    async fn handle(&mut self, msg: M, ctx: &ActorContext<M>);
+    /// Note: This method is synchronous for maximum performance
+    fn handle(&mut self, msg: M, ctx: &ActorContext<M>);
 
     /// Called when the actor is starting up
     /// Use this for initialization logic
-    async fn pre_start(&mut self, _ctx: &ActorContext<M>) -> Result<(), ActorError> {
+    fn pre_start(&mut self, _ctx: &ActorContext<M>) -> Result<(), ActorError> {
         Ok(())
     }
 
     /// Called when the actor is shutting down
     /// Use this for cleanup logic
-    async fn post_stop(&mut self, _ctx: &ActorContext<M>) -> Result<(), ActorError> {
+    fn post_stop(&mut self, _ctx: &ActorContext<M>) -> Result<(), ActorError> {
         Ok(())
     }
 
     /// Called when the actor encounters an error
     /// Return true to restart, false to stop
-    async fn on_error(&mut self, error: &ActorError, _ctx: &ActorContext<M>) -> bool {
+    fn on_error(&mut self, error: &ActorError, _ctx: &ActorContext<M>) -> bool {
         tracing::error!("Actor error: {}", error);
         false // Default: stop on error
     }
@@ -53,13 +53,12 @@ pub trait Actor<M: Message>: Send + Sync + 'static {
 
 /// Typed actor trait for stronger type safety
 /// This ensures actors can only receive their specific message type
-#[async_trait]
 pub trait TypedActor<M: Message>: Actor<M> {
     /// The specific message type this actor handles
     type Msg: Message;
 
     /// Type-safe message handling
-    async fn receive(
+    fn receive(
         &mut self,
         msg: Self::Msg,
         ctx: &ActorContext<Self::Msg>
@@ -219,6 +218,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct TestActor {
         received_messages: Vec<String>,
     }
@@ -231,9 +231,8 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Actor<TestMessage> for TestActor {
-        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+        fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_messages.push(msg.content);
         }
 

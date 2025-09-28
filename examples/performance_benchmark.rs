@@ -1,5 +1,4 @@
 use aktor::*;
-use async_trait::async_trait;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -17,24 +16,21 @@ impl Message for BenchMessage {
 }
 
 // Benchmark actor that processes messages and sends to other actors
+#[derive(Debug)]
 struct BenchActor {
     message_count: u64,
 }
 
 impl BenchActor {
-    fn new(
-        // id: u32,
-    ) -> Self {
+    fn new() -> Self {
         Self {
-            // id,
             message_count: 0,
         }
     }
 }
 
-#[async_trait]
 impl Actor<BenchMessage> for BenchActor {
-    async fn handle(&mut self, msg: BenchMessage, _ctx: &ActorContext<BenchMessage>) {
+    fn handle(&mut self, msg: BenchMessage, _ctx: &ActorContext<BenchMessage>) {
         self.message_count += 1;
 
         // Calculate latency (optional - not used currently)
@@ -64,7 +60,7 @@ impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
             actor_count: 1000,
-            messages_per_actor: 10000,
+            messages_per_actor: 50000,
         }
     }
 }
@@ -103,7 +99,7 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
         default_mailbox_size: 20000, // Large mailbox for high throughput
         ..Default::default()
     };
-    let system = ActorSystem::new(system_config)?;
+    let system = ActorSystem::new(system_config).await?;
 
     println!("\nCreating {} actors...", config.actor_count);
     let mut actor_refs = Vec::new();
@@ -121,20 +117,16 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
         ).await?;
 
         actor_refs.push(actor_ref);
-
-        // if i % 100 == 0 {
-        //     println!("Created {} actors...", i + 1);
-        // }
     }
 
     println!("Actors created. Setting up interconnections...");
+    sleep(Duration::from_millis(10000)).await;
 
     // Note: In our current design, we can't easily inject references to other actors
     // after creation, so actors will discover each other through the system registry
     // This is a design limitation we could address in future versions
 
     println!("Starting benchmark...");
-    sleep(Duration::from_millis(500)).await; // Let actors settle
 
     let benchmark_start = Instant::now();
 
@@ -143,8 +135,8 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
 
     // Start message generation
     let message_sender = tokio::spawn({
-        let actor_refs = actor_refs.clone();
-        let config = config.clone();
+        //let actor_refs = actor_refs.clone();
+        //let config = config.clone();
         let metrics_tx = metrics_tx.clone();
 
         async move {
@@ -164,7 +156,8 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
                     timestamp: Instant::now(),
                 };
 
-                if let Err(_) = actor_refs[target_idx].tell(message, Some(actor_refs[sender_idx].clone())).await {
+                //if let Err(_) = actor_refs[target_idx].tell(message, Some(actor_refs[sender_idx].clone())).await {
+                if let Err(_) = actor_refs[target_idx].tell(message, None).await {
                     total_failed += 1;
                 } else {
                     total_sent += 1;
@@ -211,6 +204,9 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
     // Give time for in-flight messages to be processed
     println!("\nWaiting for message processing to complete...");
     sleep(Duration::from_secs(2)).await;
+
+    println!("Wait 60s for memory to update in Activity Monitor");
+    sleep(Duration::from_secs(300)).await;
 
     // Cleanup
     println!("\nShutting down actor system...");

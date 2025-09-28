@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, RwLock};
 use dashmap::DashMap;
 use tracing::{debug, error, info};
 use uuid::Uuid;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Response capability for ask pattern - embedded in context during ask handling
 pub(crate) struct ResponseCapability {
@@ -57,6 +58,26 @@ pub struct ActorContext<M: Message> {
     response_capability: Option<ResponseCapability>,
 }
 
+/// Worker pool for high-performance actor message processing
+struct WorkerPool {
+    /// Worker tasks
+    workers: Vec<tokio::task::JoinHandle<()>>,
+    /// Shutdown signal
+    shutdown: Arc<AtomicBool>,
+    /// Number of worker threads
+    worker_count: usize,
+}
+
+/// Actor storage in the worker pool
+struct ActorData<M: Message> {
+    /// The actor instance
+    actor: Box<dyn Actor<M>>,
+    /// Actor context
+    context: Arc<ActorContext<M>>,
+    /// Message receiver
+    receiver: mpsc::UnboundedReceiver<crate::reference::ActorMessage<M>>,
+}
+
 /// Actor system manages the lifecycle of all actors
 pub struct ActorSystem<M: Message> {
     /// System configuration
@@ -65,6 +86,10 @@ pub struct ActorSystem<M: Message> {
     actors: Arc<DashMap<ActorAddress, ActorRef<M>>>,
     /// Node ID for this actor system instance
     node_id: String,
+    /// Worker pool for processing actor messages
+    worker_pool: Arc<RwLock<Option<WorkerPool>>>,
+    /// Actor storage (actors + contexts + receivers)
+    actor_storage: Arc<RwLock<HashMap<ActorAddress, ActorData<M>>>>,
 }
 
 /// Configuration for the actor system
@@ -300,19 +325,117 @@ impl<M: Message> ActorContext<M> {
     }
 }
 
+impl WorkerPool {
+    /// Create a new worker pool
+    fn new<M: Message>(worker_count: usize, actor_storage: Arc<RwLock<HashMap<ActorAddress, ActorData<M>>>>) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+
+        // Start worker tasks
+        for worker_id in 0..worker_count {
+            let storage = actor_storage.clone();
+            let shutdown_signal = shutdown.clone();
+
+            let worker = tokio::spawn(async move {
+                Self::worker_loop(worker_id, storage, shutdown_signal).await;
+            });
+
+            workers.push(worker);
+        }
+
+        Self {
+            workers,
+            shutdown,
+            worker_count,
+        }
+    }
+
+    /// Worker loop that processes messages
+    async fn worker_loop<M: Message>(
+        worker_id: usize,
+        actor_storage: Arc<RwLock<HashMap<ActorAddress, ActorData<M>>>>,
+        shutdown: Arc<AtomicBool>
+    ) {
+        info!("Worker {} started", worker_id);
+
+        while !shutdown.load(Ordering::Relaxed) {
+            let mut found_work = false;
+
+            // Try to process messages from any actor
+            {
+                let mut storage = actor_storage.write().await;
+                for (_address, actor_data) in storage.iter_mut() {
+                    // Try to receive a message (non-blocking)
+                    if let Ok(message) = actor_data.receiver.try_recv() {
+                        found_work = true;
+
+                        match message {
+                            crate::reference::ActorMessage::Tell { message, sender: _ } => {
+                                // Process tell message synchronously
+                                actor_data.actor.handle(message, &actor_data.context);
+                            }
+                            crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
+                                // Create ask context with response capability
+                                let response_capability = ResponseCapability::new(
+                                    request.correlation_id,
+                                    request.response_to.sender,
+                                );
+
+                                let ask_context = ActorContext::with_response_capability(
+                                    actor_data.context.actor_ref.clone(),
+                                    actor_data.context.system.clone(),
+                                    actor_data.context.parent.clone(),
+                                    actor_data.context.props.clone(),
+                                    response_capability,
+                                );
+
+                                // Process ask message synchronously
+                                actor_data.actor.handle(request.message, &ask_context);
+                            }
+                        }
+                        break; // Process one message per iteration for fairness
+                    }
+                }
+            }
+
+            if !found_work {
+                // No messages available, yield to avoid busy waiting
+                tokio::task::yield_now().await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        info!("Worker {} stopped", worker_id);
+    }
+
+    /// Shutdown the worker pool
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
 impl<M: Message> ActorSystem<M> {
     /// Create a new actor system
-    pub fn new(config: ActorSystemConfig) -> Result<Arc<Self>, ActorError> {
+    pub async fn new(config: ActorSystemConfig) -> Result<Arc<Self>, ActorError> {
         let node_id = std::env::var("NODE_ID")
             .unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
 
+        let actor_storage = Arc::new(RwLock::new(HashMap::new()));
+
         let system = Arc::new(Self {
-            config,
+            config: config.clone(),
             actors: Arc::new(DashMap::new()),
             node_id,
+            worker_pool: Arc::new(RwLock::new(None)),
+            actor_storage: actor_storage.clone(),
         });
 
-        info!("Created actor system with node ID: {}", system.node_id);
+        // Automatically start worker pool
+        let worker_count = config.thread_pool_size;
+        let worker_pool = WorkerPool::new(worker_count, actor_storage);
+        *system.worker_pool.write().await = Some(worker_pool);
+
+        info!("Created actor system with node ID: {} and {} workers", system.node_id, worker_count);
         Ok(system)
     }
 
@@ -344,7 +467,7 @@ impl<M: Message> ActorSystem<M> {
         self.spawn_actor_with_address(address, actor, props).await
     }
 
-    /// Spawn an actor with a specific address
+    /// Spawn an actor with a specific address (unified worker pool architecture)
     pub async fn spawn_actor_with_address<A>(
         self: &Arc<Self>,
         address: ActorAddress,
@@ -361,74 +484,41 @@ impl<M: Message> ActorSystem<M> {
             ));
         }
 
-        // Create message channel
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        // Create message channel for this actor
+        let (sender, receiver) = mpsc::unbounded_channel();
 
         // Create actor reference
         let actor_ref = ActorRef::new_local(address.clone(), sender);
 
         // Create actor context
-        let context = ActorContext::new(
+        let context = Arc::new(ActorContext::new(
             actor_ref.clone(),
             self.clone(),
             None, // TODO: Set parent for child actors
             props.clone(),
-        );
+        ));
+
+        // Call pre_start
+        if let Err(e) = actor.pre_start(&context) {
+            return Err(ActorError::ActorCreationFailed(
+                format!("Actor pre_start failed: {}", e),
+            ));
+        }
+
+        // Add actor to the worker pool storage
+        let actor_data = ActorData {
+            actor: Box::new(actor),
+            context,
+            receiver,
+        };
+
+        {
+            let mut storage = self.actor_storage.write().await;
+            storage.insert(address.clone(), actor_data);
+        }
 
         // Register actor
         self.actors.insert(address.clone(), actor_ref.clone());
-
-        // Spawn actor task
-        let actor_ref_clone = actor_ref.clone();
-        let context_arc = Arc::new(context);
-
-        tokio::spawn(async move {
-            // Call pre_start
-            if let Err(e) = actor.pre_start(&context_arc).await {
-                error!("Actor pre_start failed: {}", e);
-                return;
-            }
-
-            // Update state to running
-            if let Some(crate::reference::ActorState::Starting) = actor_ref_clone.state().await {
-                // TODO: Update state to Running
-            }
-
-            // Message processing loop - optimized for Tell performance
-            let context_ref = &*context_arc;
-            while let Some(actor_message) = receiver.recv().await {
-                match actor_message {
-                    crate::reference::ActorMessage::Tell { message, sender: _, /*message_id: _, timestamp: _ */} => {
-                        // Regular tell message - ULTRA-FAST path, no Result matching
-                        actor.handle(message, context_ref).await;
-                    }
-                    crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
-                        // Ask message - create context with response capability
-                        let response_capability = ResponseCapability::new(
-                            request.correlation_id,
-                            request.response_to.sender,
-                        );
-
-                        let ask_context = Arc::new(ActorContext::with_response_capability(
-                            context_arc.actor_ref.clone(),
-                            context_arc.system.clone(),
-                            context_arc.parent.clone(),
-                            context_arc.props.clone(),
-                            response_capability,
-                        ));
-
-                        actor.handle(request.message, &ask_context).await;
-                    }
-                }
-            }
-
-            // Call post_stop
-            if let Err(e) = actor.post_stop(&context_arc).await {
-                error!("Actor post_stop failed: {}", e);
-            }
-
-            // TODO: Clean up actor from system registry
-        });
 
         info!("Spawned actor: {}", address);
         Ok(actor_ref)
@@ -504,14 +594,24 @@ impl<M: Message> ActorSystem<M> {
     pub async fn shutdown(self: Arc<Self>) -> Result<(), ActorError> {
         info!("Shutting down actor system");
 
-        // Stop all actors
-        let actors: Vec<ActorRef<M>> = self.actors.iter().map(|entry| entry.value().clone()).collect();
-
-        for actor_ref in actors {
-            if let Err(e) = actor_ref.stop().await {
-                error!("Failed to stop actor {}: {}", actor_ref.address(), e);
-            }
+        // Shutdown worker pool
+        if let Some(pool) = self.worker_pool.read().await.as_ref() {
+            pool.shutdown();
         }
+
+        // Call post_stop on all actors
+        {
+            let mut storage = self.actor_storage.write().await;
+            for (address, actor_data) in storage.iter_mut() {
+                if let Err(e) = actor_data.actor.post_stop(&actor_data.context) {
+                    error!("Actor post_stop failed for {}: {}", address, e);
+                }
+            }
+            storage.clear();
+        }
+
+        // Clear actor registry
+        self.actors.clear();
 
         info!("Actor system shutdown complete");
         Ok(())
@@ -535,6 +635,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct TestActor {
         received_count: usize,
         received_messages: Vec<String>,
@@ -549,9 +650,8 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Actor<TestMessage> for TestActor {
-        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+        fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_count += 1;
             self.received_messages.push(msg.data);
         }
@@ -568,14 +668,14 @@ mod tests {
     #[tokio::test]
     async fn test_actor_system_creation() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
         assert!(!system.node_id().is_empty());
     }
 
     #[tokio::test]
     async fn test_actor_spawning() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
 
         let actor = TestActor::default();
         let props = ActorProps::default();
@@ -588,7 +688,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_sending() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
 
         let actor = TestActor::default();
         let props = ActorProps::default();
@@ -607,6 +707,7 @@ mod tests {
     }
 
     // Test actor with arguments for factory testing
+    #[derive(Debug)]
     struct ParameterizedActor {
         name: String,
         initial_value: i32,
@@ -623,9 +724,8 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Actor<TestMessage> for ParameterizedActor {
-        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+        fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.messages.push(format!("{}: {}", self.name, msg.data));
         }
 
@@ -641,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn test_actor_of() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
 
         // Test actor_of with Default actors
         let actor_ref = system.actor_of::<TestActor>("test-actor").await.unwrap();
@@ -662,7 +762,7 @@ mod tests {
     #[tokio::test]
     async fn test_actor_of_args() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
 
         // Test actor_of_args with parameterized actors
         let args = ("worker".to_string(), 42);
@@ -717,7 +817,7 @@ mod tests {
     #[tokio::test]
     async fn test_actor_of_props() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
 
         // Create actor with custom props
         let props = ActorProps::new()
@@ -742,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn test_actor_of_args_props() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
 
         // Create actor with arguments and custom props
         let args = ("custom-worker".to_string(), 999);
@@ -772,7 +872,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_actors_different_factories() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
 
         // Create multiple actors using different factory methods
         let default_actor = system.actor_of::<TestActor>("default").await.unwrap();
@@ -800,7 +900,7 @@ mod tests {
     #[tokio::test]
     async fn test_actor_name_uniqueness() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).unwrap();
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
 
         // Create first actor
         let actor1 = system.actor_of::<TestActor>("unique-name").await.unwrap();
