@@ -18,10 +18,7 @@ impl Message for BenchMessage {
 
 // Benchmark actor that processes messages and sends to other actors
 struct BenchActor {
-    // id: u32,
     message_count: u64,
-    computation_result: String,
-    other_actors: Vec<ActorRef<BenchMessage>>,
 }
 
 impl BenchActor {
@@ -31,26 +28,8 @@ impl BenchActor {
         Self {
             // id,
             message_count: 0,
-            computation_result: String::new(),
-            other_actors: Vec::new(),
         }
     }
-
-    // fn set_other_actors(&mut self, actors: Vec<ActorRef<BenchMessage>>) {
-    //     self.other_actors = actors;
-    // }
-
-    // Simulate some computation work
-    // fn simulate_work(&mut self, input: &str) {
-    //     // String concatenation to simulate computation
-    //     self.computation_result = format!("{}_{}_processed_{}",
-    //         self.computation_result, input, self.message_count);
-    //
-    //     // Keep result from growing too large
-    //     if self.computation_result.len() > 1000 {
-    //         self.computation_result = format!("actor_{}_reset_{}", self.id, self.message_count);
-    //     }
-    // }
 }
 
 #[async_trait]

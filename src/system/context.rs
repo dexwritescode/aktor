@@ -395,11 +395,25 @@ impl<M: Message> ActorSystem<M> {
             }
 
             // Message processing loop
+            let context_ref = &*context_arc;
             while let Some(actor_message) = receiver.recv().await {
-                let (message, context) = match actor_message {
+                match actor_message {
                     crate::reference::ActorMessage::Tell { message, sender: _, /*message_id: _, timestamp: _ */} => {
-                        // Regular tell message - use context without response capability
-                        (message, context_arc.clone())
+                        // Regular tell message
+                        match actor.handle(message, context_ref).await {
+                            Ok(()) => {
+                                // debug!("Message processed successfully");
+                            }
+                            Err(e) => {
+                                error!("Message handling failed: {}", e);
+
+                                // Apply supervision strategy
+                                let should_restart = actor.on_error(&e, context_ref).await;
+                                if !should_restart {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
                         // Ask message - create context with response capability
@@ -416,22 +430,19 @@ impl<M: Message> ActorSystem<M> {
                             response_capability,
                         ));
 
-                        (request.message, ask_context)
-                    }
-                };
+                        match actor.handle(request.message, &ask_context).await {
+                            Ok(()) => {
+                                debug!("Message processed successfully");
+                            }
+                            Err(e) => {
+                                error!("Message handling failed: {}", e);
 
-                // Unified message handling for both Tell and Ask
-                match actor.handle(message, &context).await {
-                    Ok(()) => {
-                        debug!("Message processed successfully");
-                    }
-                    Err(e) => {
-                        error!("Message handling failed: {}", e);
-
-                        // Apply supervision strategy
-                        let should_restart = actor.on_error(&e, &context).await;
-                        if !should_restart {
-                            break;
+                                // Apply supervision strategy
+                                let should_restart = actor.on_error(&e, &ask_context).await;
+                                if !should_restart {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
