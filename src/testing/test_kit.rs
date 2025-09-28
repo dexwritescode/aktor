@@ -416,14 +416,13 @@ struct TestProbeActor<M: Message> {
 
 #[async_trait::async_trait]
 impl<M: Message + 'static> Actor<TestMessage> for TestProbeActor<M> {
-    async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+    async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
         // Try to extract the message as type M
         if let Some(typed_message) = msg.extract::<M>() {
             let mut messages = self.messages.lock().await;
             messages.push_back(typed_message.clone());
         }
         // Ignore messages that don't match our type
-        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -577,11 +576,11 @@ mod tests {
 
     #[async_trait]
     impl Actor<TestMessage> for EchoActor {
-        async fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+        async fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
             if let Some(echo_msg) = msg.extract::<EchoMessage>() {
                 if ctx.is_ask_request() {
                     // For ask requests, respond with the message
-                    ctx.respond(TestMessage::new(echo_msg.clone())).await?;
+                    let _ = ctx.respond(TestMessage::new(echo_msg.clone())).await;
                 } else {
                     // For tell messages, we need to manually send to sender if available
                     // This simulates echoing back to the sender
@@ -592,7 +591,6 @@ mod tests {
                     // This is a simplified approach - in real usage, you'd typically use ask pattern
                 }
             }
-            Ok(())
         }
 
         fn as_any(&self) -> &dyn std::any::Any {

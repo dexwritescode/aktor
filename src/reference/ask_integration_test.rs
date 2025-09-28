@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{Actor, ActorContext, ActorError, ActorSystem, ActorSystemConfig, Message};
+    use crate::{Actor, ActorContext, ActorSystem, ActorSystemConfig, Message};
     use crate::reference::ask::{ResponseChannel, AskRequest};
     use async_trait::async_trait;
     use std::time::Duration;
@@ -42,7 +42,7 @@ mod tests {
 
     #[async_trait]
     impl Actor<EchoMessage> for EchoActor {
-        async fn handle(&mut self, msg: EchoMessage, ctx: &ActorContext<EchoMessage>) -> Result<(), ActorError> {
+        async fn handle(&mut self, msg: EchoMessage, ctx: &ActorContext<EchoMessage>) {
             self.message_count += 1;
 
             if ctx.is_ask_request() {
@@ -50,13 +50,11 @@ mod tests {
                 let response = EchoResponse {
                     echoed: format!("Echo: {}", msg.content),
                 };
-                ctx.respond(response).await?;
+                let _ = ctx.respond(response).await;
             } else {
                 // This is a tell message
                 println!("EchoActor received: {}", msg.content);
             }
-
-            Ok(())
         }
 
         fn as_any(&self) -> &dyn std::any::Any {

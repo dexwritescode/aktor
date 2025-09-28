@@ -107,7 +107,7 @@ where
     R: Message + 'static,
 {
     // Create a one-shot channel for the response
-    let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
     let correlation_id = Uuid::new_v4();
 
     // Create response channel
@@ -129,8 +129,7 @@ where
 
     // Wait for response with timeout
     let response_future = async {
-        let mut rx = response_rx;
-        while let Some(envelope) = rx.recv().await {
+        while let Some(envelope) = response_rx.recv().await {
             if envelope.correlation_id == correlation_id {
                 // Try to downcast the response to the expected type
                 if let Ok(response) = envelope.data.downcast::<R>() {

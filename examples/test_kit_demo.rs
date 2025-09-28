@@ -52,7 +52,7 @@ impl Default for CounterActor {
 
 #[async_trait]
 impl Actor<TestMessage> for CounterActor {
-    async fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+    async fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
         if let Some(counter_msg) = msg.extract::<CounterMessage>() {
             match counter_msg.operation {
                 CounterOp::Increment => {
@@ -68,14 +68,13 @@ impl Actor<TestMessage> for CounterActor {
 
                     if ctx.is_ask_request() {
                         println!("Responding to ask with count: {}", self.count);
-                        ctx.respond(TestMessage::new(response)).await?;
+                        let _ = ctx.respond(TestMessage::new(response)).await;
                     } else {
                         println!("Tell message - current count: {}", self.count);
                     }
                 }
             }
         }
-        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

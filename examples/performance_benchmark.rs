@@ -34,7 +34,7 @@ impl BenchActor {
 
 #[async_trait]
 impl Actor<BenchMessage> for BenchActor {
-    async fn handle(&mut self, msg: BenchMessage, _ctx: &ActorContext<BenchMessage>) -> Result<(), ActorError> {
+    async fn handle(&mut self, msg: BenchMessage, _ctx: &ActorContext<BenchMessage>) {
         self.message_count += 1;
 
         // Calculate latency (optional - not used currently)
@@ -42,8 +42,6 @@ impl Actor<BenchMessage> for BenchActor {
 
         // Simulate computation work
         // self.simulate_work(&msg.content);
-
-        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

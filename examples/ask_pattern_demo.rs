@@ -47,7 +47,7 @@ impl Default for StatusActor {
 
 #[async_trait]
 impl Actor<GetStatus> for StatusActor {
-    async fn handle(&mut self, _msg: GetStatus, ctx: &ActorContext<GetStatus>) -> Result<(), ActorError> {
+    async fn handle(&mut self, _msg: GetStatus, ctx: &ActorContext<GetStatus>) {
         self.message_count += 1;
 
         if ctx.is_ask_request() {
@@ -61,13 +61,11 @@ impl Actor<GetStatus> for StatusActor {
                 message_count: self.message_count,
             };
 
-            ctx.respond(status).await?;
+            let _ = ctx.respond(status).await;
         } else {
             // This is a tell message
             println!("StatusActor received tell message #{}", self.message_count);
         }
-
-        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

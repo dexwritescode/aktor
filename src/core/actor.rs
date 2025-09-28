@@ -20,7 +20,9 @@ pub trait Actor<M: Message>: Send + Sync + 'static {
     /// For Tell messages:
     /// - Process normally, no response needed
     /// - ctx.respond() will return an error if called during Tell
-    async fn handle(&mut self, msg: M, ctx: &ActorContext<M>) -> Result<(), ActorError>;
+    ///
+    /// Note: This method no longer returns Result - actors handle errors internally
+    async fn handle(&mut self, msg: M, ctx: &ActorContext<M>);
 
     /// Called when the actor is starting up
     /// Use this for initialization logic
@@ -61,7 +63,7 @@ pub trait TypedActor<M: Message>: Actor<M> {
         &mut self,
         msg: Self::Msg,
         ctx: &ActorContext<Self::Msg>
-    ) -> Result<(), ActorError>;
+    );
 }
 
 /// Supervision strategy for handling actor failures
@@ -231,9 +233,8 @@ mod tests {
 
     #[async_trait]
     impl Actor<TestMessage> for TestActor {
-        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_messages.push(msg.content);
-            Ok(())
         }
 
         fn as_any(&self) -> &dyn Any {

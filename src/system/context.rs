@@ -394,26 +394,13 @@ impl<M: Message> ActorSystem<M> {
                 // TODO: Update state to Running
             }
 
-            // Message processing loop
+            // Message processing loop - optimized for Tell performance
             let context_ref = &*context_arc;
             while let Some(actor_message) = receiver.recv().await {
                 match actor_message {
                     crate::reference::ActorMessage::Tell { message, sender: _, /*message_id: _, timestamp: _ */} => {
-                        // Regular tell message
-                        match actor.handle(message, context_ref).await {
-                            Ok(()) => {
-                                // debug!("Message processed successfully");
-                            }
-                            Err(e) => {
-                                error!("Message handling failed: {}", e);
-
-                                // Apply supervision strategy
-                                let should_restart = actor.on_error(&e, context_ref).await;
-                                if !should_restart {
-                                    break;
-                                }
-                            }
-                        }
+                        // Regular tell message - ULTRA-FAST path, no Result matching
+                        actor.handle(message, context_ref).await;
                     }
                     crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
                         // Ask message - create context with response capability
@@ -430,20 +417,7 @@ impl<M: Message> ActorSystem<M> {
                             response_capability,
                         ));
 
-                        match actor.handle(request.message, &ask_context).await {
-                            Ok(()) => {
-                                debug!("Message processed successfully");
-                            }
-                            Err(e) => {
-                                error!("Message handling failed: {}", e);
-
-                                // Apply supervision strategy
-                                let should_restart = actor.on_error(&e, &ask_context).await;
-                                if !should_restart {
-                                    break;
-                                }
-                            }
-                        }
+                        actor.handle(request.message, &ask_context).await;
                     }
                 }
             }
@@ -577,10 +551,9 @@ mod tests {
 
     #[async_trait]
     impl Actor<TestMessage> for TestActor {
-        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_count += 1;
             self.received_messages.push(msg.data);
-            Ok(())
         }
 
         fn as_any(&self) -> &dyn std::any::Any {
@@ -652,9 +625,8 @@ mod tests {
 
     #[async_trait]
     impl Actor<TestMessage> for ParameterizedActor {
-        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+        async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.messages.push(format!("{}: {}", self.name, msg.data));
-            Ok(())
         }
 
         fn as_any(&self) -> &dyn std::any::Any {

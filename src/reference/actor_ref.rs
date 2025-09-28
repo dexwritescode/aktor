@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 /// Actor reference - a handle to communicate with an actor
