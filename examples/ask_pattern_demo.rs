@@ -220,11 +220,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Shutdown the system gracefully
     system.shutdown().await?;
-
-    println!("\n=== Demo Complete ===");
-    println!("\nNote: Some asks may timeout because the current implementation");
-    println!("doesn't fully integrate ask-aware actors with the message processing loop.");
-    println!("This demonstrates the basic ask pattern infrastructure is in place!");
-
+    
     Ok(())
 }

@@ -4,6 +4,7 @@ use crate::reference::{ActorRef, ResponseEnvelope};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+use dashmap::DashMap;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -61,7 +62,7 @@ pub struct ActorSystem<M: Message> {
     /// System configuration
     config: ActorSystemConfig,
     /// All actors in the system by address
-    actors: Arc<RwLock<HashMap<ActorAddress, ActorRef<M>>>>,
+    actors: Arc<DashMap<ActorAddress, ActorRef<M>>>,
     /// Node ID for this actor system instance
     node_id: String,
 }
@@ -79,6 +80,8 @@ pub struct ActorSystemConfig {
     pub bind_address: Option<String>,
     /// Cluster seed nodes for discovery
     pub seed_nodes: Vec<String>,
+    /// Number of threads in the actor execution thread pool
+    pub thread_pool_size: usize,
 }
 
 impl Default for ActorSystemConfig {
@@ -89,6 +92,7 @@ impl Default for ActorSystemConfig {
             distributed: false,
             bind_address: None,
             seed_nodes: Vec::new(),
+            thread_pool_size: 4,
         }
     }
 }
@@ -304,7 +308,7 @@ impl<M: Message> ActorSystem<M> {
 
         let system = Arc::new(Self {
             config,
-            actors: Arc::new(RwLock::new(HashMap::new())),
+            actors: Arc::new(DashMap::new()),
             node_id,
         });
 
@@ -351,13 +355,10 @@ impl<M: Message> ActorSystem<M> {
         A: Actor<M> + 'static,
     {
         // Check if actor already exists
-        {
-            let actors = self.actors.read().await;
-            if actors.contains_key(&address) {
-                return Err(ActorError::ActorCreationFailed(
-                    format!("Actor already exists at address: {}", address),
-                ));
-            }
+        if self.actors.contains_key(&address) {
+            return Err(ActorError::ActorCreationFailed(
+                format!("Actor already exists at address: {}", address),
+            ));
         }
 
         // Create message channel
@@ -375,10 +376,7 @@ impl<M: Message> ActorSystem<M> {
         );
 
         // Register actor
-        {
-            let mut actors = self.actors.write().await;
-            actors.insert(address.clone(), actor_ref.clone());
-        }
+        self.actors.insert(address.clone(), actor_ref.clone());
 
         // Spawn actor task
         let actor_ref_clone = actor_ref.clone();
@@ -399,7 +397,7 @@ impl<M: Message> ActorSystem<M> {
             // Message processing loop
             while let Some(actor_message) = receiver.recv().await {
                 let (message, context) = match actor_message {
-                    crate::reference::ActorMessage::Tell { message, sender: _, message_id: _, timestamp: _ } => {
+                    crate::reference::ActorMessage::Tell { message, sender: _, /*message_id: _, timestamp: _ */} => {
                         // Regular tell message - use context without response capability
                         (message, context_arc.clone())
                     }
@@ -509,14 +507,12 @@ impl<M: Message> ActorSystem<M> {
 
     /// Get an actor by address
     pub async fn get_actor(&self, address: &ActorAddress) -> Option<ActorRef<M>> {
-        let actors = self.actors.read().await;
-        actors.get(address).cloned()
+        self.actors.get(address).map(|entry| entry.value().clone())
     }
 
     /// Get all actors in the system
     pub async fn get_all_actors(&self) -> Vec<ActorRef<M>> {
-        let actors = self.actors.read().await;
-        actors.values().cloned().collect()
+        self.actors.iter().map(|entry| entry.value().clone()).collect()
     }
 
     /// Shutdown the actor system gracefully
@@ -524,10 +520,7 @@ impl<M: Message> ActorSystem<M> {
         info!("Shutting down actor system");
 
         // Stop all actors
-        let actors = {
-            let actors_guard = self.actors.read().await;
-            actors_guard.values().cloned().collect::<Vec<_>>()
-        };
+        let actors: Vec<ActorRef<M>> = self.actors.iter().map(|entry| entry.value().clone()).collect();
 
         for actor_ref in actors {
             if let Err(e) = actor_ref.stop().await {

@@ -17,6 +17,9 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 futures = "0.3"
+rand = "0.8"
+rayon = "1.8"
+crossbeam = "0.8"
 
 # Optional dependencies for test-util feature
 tokio-test = { version = "0.4", optional = true }

@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Actor reference - a handle to communicate with an actor
@@ -70,10 +71,10 @@ pub enum ActorMessage<M: Message> {
         message: M,
         /// Sender reference for replies
         sender: Option<ActorRef<M>>,
-        /// Message ID for tracking
-        message_id: Uuid,
-        /// Timestamp when message was sent
-        timestamp: std::time::SystemTime,
+        // /// Message ID for tracking
+        // message_id: Uuid,
+        // /// Timestamp when message was sent
+        // timestamp: std::time::SystemTime,
     },
     /// Ask pattern request message
     Ask {
@@ -137,8 +138,8 @@ impl<M: Message> ActorRef<M> {
         let actor_message = ActorMessage::Tell {
             message,
             sender,
-            message_id: Uuid::new_v4(),
-            timestamp: std::time::SystemTime::now(),
+            // message_id: Uuid::new_v4(),
+            // timestamp: std::time::SystemTime::now(),
         };
 
         match &self.inner {
@@ -220,25 +221,10 @@ impl<M: Message> ActorRef<M> {
 impl<M: Message> LocalActorRef<M> {
     /// Send a message to the local actor
     async fn send(&self, message: ActorMessage<M>) -> Result<(), ActorError> {
-        let state = self.state.read().await;
-        match *state {
-            ActorState::Running | ActorState::Starting => {
-                self.sender
-                    .send(message)
-                    .map_err(|e| ActorError::MessageDeliveryFailed(e.to_string()))?;
-                Ok(())
-            }
-            ActorState::Stopping | ActorState::Stopped => {
-                Err(ActorError::MessageDeliveryFailed(
-                    "Actor is not running".to_string(),
-                ))
-            }
-            ActorState::Failed(ref reason) => {
-                Err(ActorError::MessageDeliveryFailed(
-                    format!("Actor failed: {}", reason),
-                ))
-            }
-        }
+        self.sender
+            .send(message)
+            .map_err(|e| ActorError::MessageDeliveryFailed(e.to_string()))?;
+        Ok(())
     }
 
     /// Update the actor's state
