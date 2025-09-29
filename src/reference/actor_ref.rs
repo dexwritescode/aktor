@@ -90,14 +90,14 @@ pub enum ActorMessage<M: Message> {
 #[async_trait]
 pub trait NetworkTransport<M: Message>: Send + Sync + fmt::Debug {
     /// Send a message to a remote actor
-    async fn send(
+    fn send(
         &self,
         target_address: &ActorAddress,
         message: ActorMessage<M>,
     ) -> Result<(), ActorError>;
 
     /// Check if the remote node is reachable
-    async fn is_reachable(&self, node_id: &str) -> bool;
+    fn is_reachable(&self, node_id: &str) -> bool;
 }
 
 impl<M: Message> ActorRef<M> {
@@ -133,17 +133,15 @@ impl<M: Message> ActorRef<M> {
     }
 
     /// Send a message to the actor (fire-and-forget)
-    pub async fn tell(&self, message: M, sender: Option<ActorRef<M>>) -> Result<(), ActorError> {
+    pub fn tell(&self, message: M, sender: Option<ActorRef<M>>) -> Result<(), ActorError> {
         let actor_message = ActorMessage::Tell {
             message,
             sender,
-            // message_id: Uuid::new_v4(),
-            // timestamp: std::time::SystemTime::now(),
         };
 
         match &self.inner {
-            ActorRefInner::Local(local_ref) => local_ref.send(actor_message).await,
-            ActorRefInner::Remote(remote_ref) => remote_ref.send(&self.address, actor_message).await,
+            ActorRefInner::Local(local_ref) => local_ref.send(actor_message),
+            ActorRefInner::Remote(remote_ref) => remote_ref.send(&self.address, actor_message),
         }
     }
 
@@ -156,8 +154,8 @@ impl<M: Message> ActorRef<M> {
         };
 
         match &self.inner {
-            ActorRefInner::Local(local_ref) => local_ref.send(actor_message).await,
-            ActorRefInner::Remote(remote_ref) => remote_ref.send(&self.address, actor_message).await,
+            ActorRefInner::Local(local_ref) => local_ref.send(actor_message),
+            ActorRefInner::Remote(remote_ref) => remote_ref.send(&self.address, actor_message),
         }
     }
 
@@ -219,7 +217,7 @@ impl<M: Message> ActorRef<M> {
 
 impl<M: Message> LocalActorRef<M> {
     /// Send a message to the local actor
-    async fn send(&self, message: ActorMessage<M>) -> Result<(), ActorError> {
+    fn send(&self, message: ActorMessage<M>) -> Result<(), ActorError> {
         self.sender
             .send(message)
             .map_err(|e| ActorError::MessageDeliveryFailed(e.to_string()))?;
@@ -235,18 +233,18 @@ impl<M: Message> LocalActorRef<M> {
 
 impl<M: Message> RemoteActorRef<M> {
     /// Send a message to the remote actor
-    async fn send(
+    fn send(
         &self,
         target_address: &ActorAddress,
         message: ActorMessage<M>,
     ) -> Result<(), ActorError> {
-        if !self.transport.is_reachable(&self.target_node).await {
+        if !self.transport.is_reachable(&self.target_node) {
             return Err(ActorError::NetworkError(
                 format!("Node {} is not reachable", self.target_node),
             ));
         }
 
-        self.transport.send(target_address, message).await
+        self.transport.send(target_address, message)
     }
 }
 
@@ -276,7 +274,7 @@ pub struct DummyTransport;
 
 #[async_trait]
 impl<M: Message> NetworkTransport<M> for DummyTransport {
-    async fn send(
+    fn send(
         &self,
         _target_address: &ActorAddress,
         _message: ActorMessage<M>,
@@ -286,7 +284,7 @@ impl<M: Message> NetworkTransport<M> for DummyTransport {
         ))
     }
 
-    async fn is_reachable(&self, _node_id: &str) -> bool {
+    fn is_reachable(&self, _node_id: &str) -> bool {
         false
     }
 }

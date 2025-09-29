@@ -157,7 +157,7 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
                 };
 
                 //if let Err(_) = actor_refs[target_idx].tell(message, Some(actor_refs[sender_idx].clone())).await {
-                if let Err(_) = actor_refs[target_idx].tell(message, None).await {
+                if let Err(_) = actor_refs[target_idx].tell(message, None) {
                     total_failed += 1;
                 } else {
                     total_sent += 1;

@@ -270,12 +270,12 @@ impl<M: Message> ActorContext<M> {
     }
 
     /// Send a message to another actor
-    pub async fn send_to(
+    pub fn send_to(
         &self,
         target: &ActorRef<M>,
         message: M,
     ) -> Result<(), ActorError> {
-        target.tell(message, Some(self.actor_ref.clone())).await
+        target.tell(message, Some(self.actor_ref.clone()))
     }
 
     /// Look up an actor by address
@@ -301,7 +301,7 @@ impl<M: Message> ActorContext<M> {
 
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            if let Err(e) = target.tell(message, sender).await {
+            if let Err(e) = target.tell(message, sender) {
                 error!("Scheduled message delivery failed: {}", e);
             }
         });
