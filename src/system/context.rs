@@ -76,6 +76,8 @@ struct ActorData<M: Message> {
     context: Arc<ActorContext<M>>,
     /// Message receiver
     receiver: mpsc::UnboundedReceiver<crate::reference::ActorMessage<M>>,
+    /// Flag to prevent duplicate scheduling in work queue
+    scheduled: Arc<AtomicBool>,
 }
 
 /// Actor system manages the lifecycle of all actors
@@ -88,8 +90,10 @@ pub struct ActorSystem<M: Message> {
     node_id: String,
     /// Worker pool for processing actor messages
     worker_pool: Arc<RwLock<Option<WorkerPool>>>,
-    /// Actor storage (actors + contexts + receivers)
-    actor_storage: Arc<RwLock<HashMap<ActorAddress, ActorData<M>>>>,
+    /// Actor storage (actors + contexts + receivers) - DashMap for fine-grained locking
+    actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
+    /// Work-stealing queue for reactive scheduling
+    work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
 }
 
 /// Configuration for the actor system
@@ -326,18 +330,23 @@ impl<M: Message> ActorContext<M> {
 }
 
 impl WorkerPool {
-    /// Create a new worker pool
-    fn new<M: Message>(worker_count: usize, actor_storage: Arc<RwLock<HashMap<ActorAddress, ActorData<M>>>>) -> Self {
+    /// Create a new worker pool with work-stealing architecture
+    fn new<M: Message>(
+        worker_count: usize,
+        actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
+        work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
+    ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::new();
 
         // Start worker tasks
         for worker_id in 0..worker_count {
             let storage = actor_storage.clone();
+            let queue = work_queue.clone();
             let shutdown_signal = shutdown.clone();
 
             let worker = tokio::spawn(async move {
-                Self::worker_loop(worker_id, storage, shutdown_signal).await;
+                Self::worker_loop(worker_id, storage, queue, shutdown_signal).await;
             });
 
             workers.push(worker);
@@ -350,58 +359,103 @@ impl WorkerPool {
         }
     }
 
-    /// Worker loop that processes messages
+    /// Worker loop with work-stealing - only processes actors with pending messages
     async fn worker_loop<M: Message>(
         worker_id: usize,
-        actor_storage: Arc<RwLock<HashMap<ActorAddress, ActorData<M>>>>,
+        actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
+        work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
         shutdown: Arc<AtomicBool>
     ) {
         info!("Worker {} started", worker_id);
+        const BATCH_SIZE: usize = 10; // Process up to 10 messages per actor before re-scheduling
 
         while !shutdown.load(Ordering::Relaxed) {
-            let mut found_work = false;
+            // Try to steal an actor address from the work queue
+            match work_queue.steal() {
+                crossbeam::deque::Steal::Success(address) => {
+                    // Get mutable access to the actor
+                    if let Some(mut actor_entry) = actor_storage.get_mut(&address) {
+                        let mut processed = 0;
 
-            // Try to process messages from any actor
-            {
-                let mut storage = actor_storage.write().await;
-                for (_address, actor_data) in storage.iter_mut() {
-                    // Try to receive a message (non-blocking)
-                    if let Ok(message) = actor_data.receiver.try_recv() {
-                        found_work = true;
+                        // Clone context Arc to avoid borrow checker issues
+                        let context = actor_entry.context.clone();
 
-                        match message {
-                            crate::reference::ActorMessage::Tell { message, sender: _ } => {
-                                // Process tell message synchronously
-                                actor_data.actor.handle(message, &actor_data.context);
-                            }
-                            crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
-                                // Create ask context with response capability
-                                let response_capability = ResponseCapability::new(
-                                    request.correlation_id,
-                                    request.response_to.sender,
-                                );
+                        // Process messages in batches for better cache locality
+                        while processed < BATCH_SIZE {
+                            match actor_entry.receiver.try_recv() {
+                                Ok(message) => {
+                                    match message {
+                                        crate::reference::ActorMessage::Tell { message, sender: _ } => {
+                                            // Process tell message synchronously
+                                            actor_entry.actor.handle(message, &context);
+                                        }
+                                        crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
+                                            // Create ask context with response capability
+                                            let response_capability = ResponseCapability::new(
+                                                request.correlation_id,
+                                                request.response_to.sender,
+                                            );
 
-                                let ask_context = ActorContext::with_response_capability(
-                                    actor_data.context.actor_ref.clone(),
-                                    actor_data.context.system.clone(),
-                                    actor_data.context.parent.clone(),
-                                    actor_data.context.props.clone(),
-                                    response_capability,
-                                );
+                                            let ask_context = ActorContext::with_response_capability(
+                                                context.actor_ref.clone(),
+                                                context.system.clone(),
+                                                context.parent.clone(),
+                                                context.props.clone(),
+                                                response_capability,
+                                            );
 
-                                // Process ask message synchronously
-                                actor_data.actor.handle(request.message, &ask_context);
+                                            // Process ask message synchronously
+                                            actor_entry.actor.handle(request.message, &ask_context);
+                                        }
+                                    }
+                                    processed += 1;
+                                }
+                                Err(_) => break, // No more messages for this actor
                             }
                         }
-                        break; // Process one message per iteration for fairness
+
+                        // Re-schedule actor if more messages remain
+                        match actor_entry.receiver.try_recv() {
+                            Ok(message) => {
+                                // Put the message back (we can't, so just process it)
+                                match message {
+                                    crate::reference::ActorMessage::Tell { message, sender: _ } => {
+                                        actor_entry.actor.handle(message, &context);
+                                    }
+                                    crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
+                                        let response_capability = ResponseCapability::new(
+                                            request.correlation_id,
+                                            request.response_to.sender,
+                                        );
+                                        let ask_context = ActorContext::with_response_capability(
+                                            context.actor_ref.clone(),
+                                            context.system.clone(),
+                                            context.parent.clone(),
+                                            context.props.clone(),
+                                            response_capability,
+                                        );
+                                        actor_entry.actor.handle(request.message, &ask_context);
+                                    }
+                                }
+                                // Re-push to queue if there might be more messages
+                                work_queue.push(address);
+                            }
+                            Err(_) => {
+                                // No more messages - clear scheduled flag
+                                actor_entry.scheduled.store(false, Ordering::Release);
+                            }
+                        }
                     }
                 }
-            }
-
-            if !found_work {
-                // No messages available, yield to avoid busy waiting
-                tokio::task::yield_now().await;
-                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                crossbeam::deque::Steal::Empty => {
+                    // No work available - yield briefly
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+                }
+                crossbeam::deque::Steal::Retry => {
+                    // Retry immediately
+                    continue;
+                }
             }
         }
 
@@ -420,7 +474,8 @@ impl<M: Message> ActorSystem<M> {
         let node_id = std::env::var("NODE_ID")
             .unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
 
-        let actor_storage = Arc::new(RwLock::new(HashMap::new()));
+        let actor_storage = Arc::new(DashMap::new());
+        let work_queue = Arc::new(crossbeam::deque::Injector::new());
 
         let system = Arc::new(Self {
             config: config.clone(),
@@ -428,11 +483,12 @@ impl<M: Message> ActorSystem<M> {
             node_id,
             worker_pool: Arc::new(RwLock::new(None)),
             actor_storage: actor_storage.clone(),
+            work_queue: work_queue.clone(),
         });
 
         // Automatically start worker pool
         let worker_count = config.thread_pool_size;
-        let worker_pool = WorkerPool::new(worker_count, actor_storage);
+        let worker_pool = WorkerPool::new(worker_count, actor_storage, work_queue);
         *system.worker_pool.write().await = Some(worker_pool);
 
         info!("Created actor system with node ID: {} and {} workers", system.node_id, worker_count);
@@ -488,7 +544,13 @@ impl<M: Message> ActorSystem<M> {
         let (sender, receiver) = mpsc::unbounded_channel();
 
         // Create actor reference
-        let actor_ref = ActorRef::new_local(address.clone(), sender);
+        let mut actor_ref = ActorRef::new_local(address.clone(), sender);
+
+        // Create scheduled flag for reactive scheduling
+        let scheduled = Arc::new(AtomicBool::new(false));
+
+        // Set up reactive scheduling on the actor reference
+        actor_ref.set_scheduling(self.work_queue.clone(), scheduled.clone());
 
         // Create actor context
         let context = Arc::new(ActorContext::new(
@@ -510,12 +572,11 @@ impl<M: Message> ActorSystem<M> {
             actor: Box::new(actor),
             context,
             receiver,
+            scheduled,
         };
 
-        {
-            let mut storage = self.actor_storage.write().await;
-            storage.insert(address.clone(), actor_data);
-        }
+        // Insert into DashMap (no need for write lock)
+        self.actor_storage.insert(address.clone(), actor_data);
 
         // Register actor
         self.actors.insert(address.clone(), actor_ref.clone());
@@ -600,15 +661,13 @@ impl<M: Message> ActorSystem<M> {
         }
 
         // Call post_stop on all actors
-        {
-            let mut storage = self.actor_storage.write().await;
-            for (address, actor_data) in storage.iter_mut() {
-                if let Err(e) = actor_data.actor.post_stop(&actor_data.context) {
-                    error!("Actor post_stop failed for {}: {}", address, e);
-                }
+        for mut entry in self.actor_storage.iter_mut() {
+            let (address, actor_data) = entry.pair_mut();
+            if let Err(e) = actor_data.actor.post_stop(&actor_data.context) {
+                error!("Actor post_stop failed for {}: {}", address, e);
             }
-            storage.clear();
         }
+        self.actor_storage.clear();
 
         // Clear actor registry
         self.actors.clear();

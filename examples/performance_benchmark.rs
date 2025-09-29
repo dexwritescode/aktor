@@ -1,4 +1,6 @@
 use aktor::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -7,6 +9,7 @@ use tokio::time::sleep;
 struct BenchMessage {
     // content: String,
     timestamp: Instant,
+    processed_counter: Arc<AtomicU64>,
 }
 
 impl Message for BenchMessage {
@@ -27,17 +30,33 @@ impl BenchActor {
             message_count: 0,
         }
     }
+
+    /// Simulate light computational work
+    /// This does some simple arithmetic to prevent the compiler from optimizing it away
+    fn simulate_work(&mut self) {
+        // Simulate ~10 microseconds of CPU work
+        let mut sum = 0u64;
+        for i in 0..100 {
+            sum = sum.wrapping_add(i * self.message_count);
+            sum = sum.wrapping_mul(1103515245).wrapping_add(12345); // LCG step
+        }
+        // Prevent compiler from optimizing away the loop
+        std::hint::black_box(sum);
+    }
 }
 
 impl Actor<BenchMessage> for BenchActor {
     fn handle(&mut self, msg: BenchMessage, _ctx: &ActorContext<BenchMessage>) {
         self.message_count += 1;
 
+        // Increment processed counter
+        msg.processed_counter.fetch_add(1, Ordering::Relaxed);
+
         // Calculate latency (optional - not used currently)
         let _latency = msg.timestamp.elapsed().as_nanos() as u64;
 
         // Simulate computation work
-        // self.simulate_work(&msg.content);
+        self.simulate_work();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -59,7 +78,7 @@ struct BenchmarkConfig {
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
-            actor_count: 1000,
+            actor_count: 10000,
             messages_per_actor: 50000,
         }
     }
@@ -132,12 +151,14 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
 
     // Channel for passing metrics between tasks
     let (metrics_tx, mut metrics_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+    let processed_counter = Arc::new(AtomicU64::new(0));
 
     // Start message generation
     let message_sender = tokio::spawn({
         //let actor_refs = actor_refs.clone();
         //let config = config.clone();
         let metrics_tx = metrics_tx.clone();
+        let processed_counter = processed_counter.clone();
 
         async move {
             let total_messages = (config.actor_count * config.messages_per_actor) as u64;
@@ -148,12 +169,13 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
 
             // Send all messages as fast as possible
             for i in 0..total_messages {
-                let sender_idx = (i % actor_refs.len() as u64) as usize;
+                let _sender_idx = (i % actor_refs.len() as u64) as usize;
                 let target_idx = ((i + 1) % actor_refs.len() as u64) as usize;
 
                 let message = BenchMessage {
                     // content: format!("benchmark_msg_{}", i),
                     timestamp: Instant::now(),
+                    processed_counter: processed_counter.clone(),
                 };
 
                 //if let Err(_) = actor_refs[target_idx].tell(message, Some(actor_refs[sender_idx].clone())).await {
@@ -201,12 +223,19 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
     println!("Error rate: {:.2}%", error_rate);
     println!("Messages per actor per second: {:.1}", send_rate / config.actor_count as f64);
 
+    // Check how many messages were processed immediately
+    let processed_at_send_complete = processed_counter.load(Ordering::Relaxed);
+    println!("\n=== PROCESSING STATS ===");
+    println!("Messages processed during sending: {}/{}", processed_at_send_complete, final_sent);
+    println!("Processing rate: {:.1}%", (processed_at_send_complete as f64 / final_sent as f64) * 100.0);
+
     // Give time for in-flight messages to be processed
-    println!("\nWaiting for message processing to complete...");
+    println!("\nWaiting for remaining message processing...");
     sleep(Duration::from_secs(2)).await;
 
-    println!("Wait 60s for memory to update in Activity Monitor");
-    sleep(Duration::from_secs(300)).await;
+    let final_processed = processed_counter.load(Ordering::Relaxed);
+    println!("Total messages processed: {}/{}", final_processed, final_sent);
+    println!("Final processing rate: {:.1}%", (final_processed as f64 / final_sent as f64) * 100.0);
 
     // Cleanup
     println!("\nShutting down actor system...");
