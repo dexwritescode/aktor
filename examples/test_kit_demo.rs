@@ -6,7 +6,6 @@
 //! Run with: cargo run --example test_kit_demo --features test-util
 
 use aktor::*;
-use async_trait::async_trait;
 use std::time::Duration;
 
 // Example messages for our demo
@@ -40,6 +39,7 @@ impl Message for CounterResponse {
 }
 
 // Example actor for testing
+#[derive(Debug)]
 struct CounterActor {
     count: i32,
 }
@@ -50,9 +50,8 @@ impl Default for CounterActor {
     }
 }
 
-#[async_trait]
 impl Actor<TestMessage> for CounterActor {
-    async fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+    fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
         if let Some(counter_msg) = msg.extract::<CounterMessage>() {
             match counter_msg.operation {
                 CounterOp::Increment => {
@@ -68,7 +67,10 @@ impl Actor<TestMessage> for CounterActor {
 
                     if ctx.is_ask_request() {
                         println!("Responding to ask with count: {}", self.count);
-                        let _ = ctx.respond(TestMessage::new(response)).await;
+                        let ctx = ctx.clone();
+                        tokio::spawn(async move {
+                            let _ = ctx.respond(TestMessage::new(response)).await;
+                        });
                     } else {
                         println!("Tell message - current count: {}", self.count);
                     }
@@ -119,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn asynchronous_testing_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("Creating ActorTestKit for integration testing...");
 
-    let test_kit = ActorTestKit::new();
+    let test_kit = ActorTestKit::new().await;
     let counter = test_kit.spawn(CounterActor::default(), "counter").await?;
 
     println!("✅ Counter actor spawned successfully");
@@ -127,15 +129,15 @@ async fn asynchronous_testing_demo() -> Result<(), Box<dyn std::error::Error>> {
     // Test basic operations
     counter.tell(TestMessage::new(CounterMessage {
         operation: CounterOp::Increment
-    }), None).await?;
+    }), None)?;
 
     counter.tell(TestMessage::new(CounterMessage {
         operation: CounterOp::Increment
-    }), None).await?;
+    }), None)?;
 
     counter.tell(TestMessage::new(CounterMessage {
         operation: CounterOp::Decrement
-    }), None).await?;
+    }), None)?;
 
     // Wait for message processing
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -150,19 +152,19 @@ async fn asynchronous_testing_demo() -> Result<(), Box<dyn std::error::Error>> {
 async fn ask_pattern_testing_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing ask pattern with ActorTestKit...");
 
-    let test_kit = ActorTestKit::new();
+    let test_kit = ActorTestKit::new().await;
     let counter = test_kit.spawn(CounterActor::default(), "ask-counter").await?;
 
     // Increment a few times
     counter.tell(TestMessage::new(CounterMessage {
         operation: CounterOp::Increment
-    }), None).await?;
+    }), None)?;
     counter.tell(TestMessage::new(CounterMessage {
         operation: CounterOp::Increment
-    }), None).await?;
+    }), None)?;
     counter.tell(TestMessage::new(CounterMessage {
         operation: CounterOp::Increment
-    }), None).await?;
+    }), None)?;
 
     // Wait for processing
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -187,7 +189,7 @@ async fn ask_pattern_testing_demo() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_probe_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("Demonstrating test probes for message capture...");
 
-    let test_kit = ActorTestKit::new();
+    let test_kit = ActorTestKit::new().await;
     let probe = test_kit.create_test_probe::<CounterResponse>().await;
 
     println!("✅ Test probe created");
@@ -196,7 +198,7 @@ async fn test_probe_demo() -> Result<(), Box<dyn std::error::Error>> {
     probe.actor_ref().tell(
         TestMessage::new(CounterResponse { count: 42 }),
         None
-    ).await?;
+    )?;
 
     // Wait for message processing
     tokio::time::sleep(Duration::from_millis(50)).await;

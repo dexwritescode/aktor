@@ -17,7 +17,7 @@
 //!
 //! #[tokio::test]
 //! async fn test_echo_actor() {
-//!     let test_kit = ActorTestKit::new();
+//!     let test_kit = ActorTestKit::new().await;
 //!     let probe = test_kit.create_test_probe::<String>();
 //!
 //!     let echo = test_kit.spawn(EchoActor::default(), "echo").await?;
@@ -200,9 +200,9 @@ impl<T> ExpectationResult<T> {
 
 impl ActorTestKit {
     /// Create a new test kit with default configuration
-    pub fn new() -> Self {
+    pub async fn new() -> Self {
         let config = ActorSystemConfig::default();
-        let system = ActorSystem::new(config).expect("Failed to create test actor system");
+        let system = ActorSystem::new(config).await.expect("Failed to create test actor system");
 
         Self {
             system,
@@ -211,8 +211,8 @@ impl ActorTestKit {
     }
 
     /// Create a new test kit with custom configuration
-    pub fn with_config(config: ActorSystemConfig) -> Self {
-        let system = ActorSystem::new(config).expect("Failed to create test actor system");
+    pub async fn with_config(config: ActorSystemConfig) -> Self {
+        let system = ActorSystem::new(config).await.expect("Failed to create test actor system");
 
         Self {
             system,
@@ -289,11 +289,8 @@ impl ActorTestKit {
     }
 }
 
-impl Default for ActorTestKit {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Note: Default trait cannot be implemented for async constructors
+// Users should call ActorTestKit::new().await directly
 
 impl<M: Message + 'static> TestProbe<M> {
     /// Get the actor reference for this probe
@@ -409,18 +406,21 @@ impl<M: Message + 'static> TestProbe<M> {
 }
 
 /// Test probe actor implementation
+#[derive(Debug)]
 struct TestProbeActor<M: Message> {
     messages: Arc<Mutex<VecDeque<M>>>,
     message_type: std::marker::PhantomData<M>,
 }
 
-#[async_trait::async_trait]
 impl<M: Message + 'static> Actor<TestMessage> for TestProbeActor<M> {
-    async fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
-        // Try to extract the message as type M
-        if let Some(typed_message) = msg.extract::<M>() {
-            let mut messages = self.messages.lock().await;
-            messages.push_back(typed_message.clone());
+    fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+        // Try to extract the message as type M and clone it immediately
+        if let Some(typed_message) = msg.extract::<M>().cloned() {
+            let messages = self.messages.clone();
+            tokio::spawn(async move {
+                let mut messages = messages.lock().await;
+                messages.push_back(typed_message);
+            });
         }
         // Ignore messages that don't match our type
     }
@@ -559,7 +559,6 @@ impl<M: Message> MockActorContext<M> {
 mod tests {
     use super::*;
     use crate::{Actor, ActorContext, ActorError, Message};
-    use async_trait::async_trait;
 
     #[derive(Debug, Clone, PartialEq)]
     struct EchoMessage {
@@ -572,15 +571,19 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct EchoActor;
 
-    #[async_trait]
     impl Actor<TestMessage> for EchoActor {
-        async fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+        fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
             if let Some(echo_msg) = msg.extract::<EchoMessage>() {
                 if ctx.is_ask_request() {
                     // For ask requests, respond with the message
-                    let _ = ctx.respond(TestMessage::new(echo_msg.clone())).await;
+                    let ctx = ctx.clone();
+                    let echo_msg = echo_msg.clone();
+                    tokio::spawn(async move {
+                        let _ = ctx.respond(TestMessage::new(echo_msg)).await;
+                    });
                 } else {
                     // For tell messages, we need to manually send to sender if available
                     // This simulates echoing back to the sender
@@ -604,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_actor_test_kit_creation() {
-        let test_kit = ActorTestKit::new();
+        let test_kit = ActorTestKit::new().await;
         assert!(test_kit.system().node_id().starts_with("node-"));
 
         test_kit.shutdown().await.unwrap();
@@ -612,7 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_test_probe_creation() {
-        let test_kit = ActorTestKit::new();
+        let test_kit = ActorTestKit::new().await;
         let probe = test_kit.create_test_probe::<EchoMessage>().await;
 
         assert_eq!(probe.message_count().await, 0);
@@ -622,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_message_expectation() {
-        let test_kit = ActorTestKit::new();
+        let test_kit = ActorTestKit::new().await;
         let probe = test_kit.create_test_probe::<EchoMessage>().await;
 
         let _echo = test_kit.spawn(EchoActor, "echo").await.unwrap();
@@ -632,7 +635,7 @@ mod tests {
         };
 
         // Send message directly to the probe to test basic functionality
-        probe.actor_ref().tell(TestMessage::new(message.clone()), None).await.unwrap();
+        probe.actor_ref().tell(TestMessage::new(message.clone()), None).unwrap();
 
         // Wait a bit for message processing
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -660,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_pattern_with_test_kit() {
-        let test_kit = ActorTestKit::new();
+        let test_kit = ActorTestKit::new().await;
         let echo = test_kit.spawn(EchoActor, "echo").await.unwrap();
 
         let message = EchoMessage {

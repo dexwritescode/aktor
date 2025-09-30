@@ -2,7 +2,6 @@
 mod tests {
     use crate::{Actor, ActorContext, ActorSystem, ActorSystemConfig, Message};
     use crate::reference::ask::{ResponseChannel, AskRequest};
-    use async_trait::async_trait;
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -50,8 +49,11 @@ mod tests {
                 let response = EchoResponse {
                     echoed: format!("Echo: {}", msg.content),
                 };
-                // TODO: Fix response handling for sync actors
-                // let _ = ctx.respond(response).await;
+                // Spawn task to send async response from sync handler
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let _ = ctx.respond(response).await;
+                });
             } else {
                 // This is a tell message
                 println!("EchoActor received: {}", msg.content);
@@ -211,7 +213,7 @@ mod tests {
         };
 
         // Test that regular tell still works
-        let result = actor_ref.tell(message, None).await;
+        let result = actor_ref.tell(message, None);
         assert!(result.is_ok());
 
         // Give time for message processing

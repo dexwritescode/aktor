@@ -43,6 +43,7 @@ impl ResponseCapability {
 
 /// Actor context provides the runtime environment for an actor
 /// This is passed to actors during message handling and lifecycle events
+#[derive(Clone)]
 pub struct ActorContext<M: Message> {
     /// Reference to this actor
     pub actor_ref: ActorRef<M>,
@@ -55,17 +56,13 @@ pub struct ActorContext<M: Message> {
     /// Actor properties and configuration
     props: ActorProps,
     /// Response capability (only present during ask requests)
-    response_capability: Option<ResponseCapability>,
+    response_capability: Option<Arc<ResponseCapability>>,
 }
 
 /// Worker pool for high-performance actor message processing
 struct WorkerPool {
-    /// Worker tasks
-    workers: Vec<tokio::task::JoinHandle<()>>,
     /// Shutdown signal
     shutdown: Arc<AtomicBool>,
-    /// Number of worker threads
-    worker_count: usize,
 }
 
 /// Actor storage in the worker pool
@@ -158,14 +155,14 @@ impl<M: Message> ActorContext<M> {
             children: Arc::new(RwLock::new(HashMap::new())),
             parent,
             props,
-            response_capability: Some(response_capability),
+            response_capability: Some(Arc::new(response_capability)),
         }
     }
 
     /// Send a response back (only works during ask handling)
     pub async fn respond<R: Message + 'static>(&self, response: R) -> Result<(), ActorError> {
         if let Some(capability) = &self.response_capability {
-            capability.send_response(response).await
+            capability.as_ref().send_response(response).await
         } else {
             Err(ActorError::MessageDeliveryFailed(
                 "Cannot respond: not an ask request".to_string(),
@@ -353,9 +350,7 @@ impl WorkerPool {
         }
 
         Self {
-            workers,
             shutdown,
-            worker_count,
         }
     }
 
@@ -681,7 +676,6 @@ impl<M: Message> ActorSystem<M> {
 mod tests {
     use super::*;
     use crate::{Actor, ActorError, Message};
-    use async_trait::async_trait;
 
     #[derive(Debug, Clone)]
     struct TestMessage {
@@ -761,7 +755,7 @@ mod tests {
         // Give the actor a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let result = actor_ref.tell(message, None).await;
+        let result = actor_ref.tell(message, None);
         assert!(result.is_ok());
     }
 
@@ -814,7 +808,7 @@ mod tests {
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let result = actor_ref.tell(message, None).await;
+        let result = actor_ref.tell(message, None);
         assert!(result.is_ok());
     }
 
@@ -836,7 +830,7 @@ mod tests {
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let result = actor_ref.tell(message, None).await;
+        let result = actor_ref.tell(message, None);
         assert!(result.is_ok());
     }
 
@@ -894,7 +888,7 @@ mod tests {
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let result = actor_ref.tell(message, None).await;
+        let result = actor_ref.tell(message, None);
         assert!(result.is_ok());
     }
 
@@ -924,7 +918,7 @@ mod tests {
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let result = actor_ref.tell(message, None).await;
+        let result = actor_ref.tell(message, None);
         assert!(result.is_ok());
     }
 
@@ -952,8 +946,8 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        assert!(default_actor.tell(msg1, None).await.is_ok());
-        assert!(param_actor.tell(msg2, None).await.is_ok());
+        assert!(default_actor.tell(msg1, None).is_ok());
+        assert!(param_actor.tell(msg2, None).is_ok());
     }
 
     #[tokio::test]

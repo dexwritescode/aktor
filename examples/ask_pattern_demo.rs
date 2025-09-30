@@ -1,5 +1,4 @@
 use aktor::*;
-use async_trait::async_trait;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -31,6 +30,7 @@ impl Message for Status {
 
 
 // Example actor that can respond to ask pattern requests
+#[derive(Debug)]
 struct StatusActor {
     message_count: u64,
     start_time: std::time::Instant,
@@ -45,9 +45,8 @@ impl Default for StatusActor {
     }
 }
 
-#[async_trait]
 impl Actor<GetStatus> for StatusActor {
-    async fn handle(&mut self, _msg: GetStatus, ctx: &ActorContext<GetStatus>) {
+    fn handle(&mut self, _msg: GetStatus, ctx: &ActorContext<GetStatus>) {
         self.message_count += 1;
 
         if ctx.is_ask_request() {
@@ -61,7 +60,11 @@ impl Actor<GetStatus> for StatusActor {
                 message_count: self.message_count,
             };
 
-            let _ = ctx.respond(status).await;
+            // Spawn task to send async response from sync handler
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let _ = ctx.respond(status).await;
+            });
         } else {
             // This is a tell message
             println!("StatusActor received tell message #{}", self.message_count);
@@ -86,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create actor system
     let config = ActorSystemConfig::default();
-    let system = ActorSystem::new(config)?;
+    let system = ActorSystem::new(config).await?;
 
     // Spawn status actor
     let status_actor = StatusActor::default();
@@ -203,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Example 7: Compare tell vs ask
     println!("Sending tell message (fire-and-forget)...");
-    actor_ref.tell(GetStatus, None).await?;
+    actor_ref.tell(GetStatus, None)?;
 
     println!("Sending ask message (request-response)...");
     let message = GetStatus;
