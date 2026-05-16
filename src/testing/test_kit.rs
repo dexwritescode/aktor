@@ -424,14 +424,6 @@ impl<M: Message + 'static> Actor<TestMessage> for TestProbeActor<M> {
         }
         // Ignore messages that don't match our type
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 }
 
 /// TestContext for synchronous testing of actor logic
@@ -594,14 +586,6 @@ mod tests {
                     // This is a simplified approach - in real usage, you'd typically use ask pattern
                 }
             }
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
         }
     }
 

@@ -2,6 +2,7 @@
 pub mod core;
 pub mod system;
 pub mod reference;
+pub mod extensions;
 
 // Optional testing module
 #[cfg(feature = "test-util")]

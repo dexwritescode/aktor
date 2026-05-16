@@ -1,5 +1,5 @@
 use crate::core::{Actor, ActorError, Message, ActorFactoryArgs, ActorProps};
-use crate::system::ActorAddress;
+use crate::system::{ActorAddress, extension::{Extension, ExtensionRegistry}};
 use crate::reference::{ActorRef, ResponseEnvelope};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,6 +91,8 @@ pub struct ActorSystem<M: Message> {
     actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
     /// Work-stealing queue for reactive scheduling
     work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
+    /// Extension registry for shared resources (HTTP clients, DB pools, etc.)
+    extensions: Arc<crate::system::extension::ExtensionRegistry>,
 }
 
 /// Configuration for the actor system
@@ -479,6 +481,7 @@ impl<M: Message> ActorSystem<M> {
             worker_pool: Arc::new(RwLock::new(None)),
             actor_storage: actor_storage.clone(),
             work_queue: work_queue.clone(),
+            extensions: Arc::new(ExtensionRegistry::new()),
         });
 
         // Automatically start worker pool
@@ -670,6 +673,59 @@ impl<M: Message> ActorSystem<M> {
         info!("Actor system shutdown complete");
         Ok(())
     }
+
+    /// Register an extension with the actor system
+    ///
+    /// Extensions are shared resources (HTTP clients, DB pools, etc.) that actors can access.
+    ///
+    /// # Panics
+    /// Panics if an extension of this type is already registered.
+    ///
+    /// # Example
+    /// ```ignore
+    /// system.register_extension(HttpClientExtension::new());
+    /// ```
+    pub fn register_extension<T: Extension>(&self, extension: T) {
+        self.extensions.register(extension);
+    }
+
+    /// Get an extension by type
+    ///
+    /// # Panics
+    /// Panics if the extension is not registered.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let http = system.extension::<HttpClientExtension>();
+    /// ```
+    pub fn extension<T: Extension>(&self) -> Arc<T> {
+        self.extensions.get::<T>()
+    }
+
+    /// Get an extension by type, returning None if not registered
+    ///
+    /// # Example
+    /// ```ignore
+    /// if let Some(http) = system.extension_optional::<HttpClientExtension>() {
+    ///     // Use http client
+    /// }
+    /// ```
+    pub fn extension_optional<T: Extension>(&self) -> Option<Arc<T>> {
+        self.extensions.get_optional::<T>()
+    }
+
+    /// Get or create an extension
+    ///
+    /// If the extension is already registered, returns it.
+    /// Otherwise, creates a new instance and registers it.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let http = system.get_or_create_extension::<HttpClientExtension>();
+    /// ```
+    pub fn get_or_create_extension<T: Extension>(&self) -> Arc<T> {
+        self.extensions.get_or_create::<T>()
+    }
 }
 
 #[cfg(test)]
@@ -707,14 +763,6 @@ mod tests {
         fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_count += 1;
             self.received_messages.push(msg.data);
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
         }
     }
 
@@ -780,14 +828,6 @@ mod tests {
     impl Actor<TestMessage> for ParameterizedActor {
         fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.messages.push(format!("{}: {}", self.name, msg.data));
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
         }
     }
 

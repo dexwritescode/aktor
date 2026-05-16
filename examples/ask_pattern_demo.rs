@@ -70,14 +70,6 @@ impl Actor<GetStatus> for StatusActor {
             println!("StatusActor received tell message #{}", self.message_count);
         }
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 }
 
 #[tokio::main]

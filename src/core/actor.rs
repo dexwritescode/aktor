@@ -1,5 +1,4 @@
 use crate::{ActorContext, ActorError, Message};
-use std::any::Any;
 
 /// Core trait that all actors must implement
 /// Generic over the message type for type safety
@@ -42,13 +41,6 @@ pub trait Actor<M: Message>: Send + Sync + std::fmt::Debug + 'static {
         tracing::error!("Actor error: {}", error);
         false // Default: stop on error
     }
-
-    /// Get the actor's current state as Any for inspection
-    /// Used for debugging and state persistence
-    fn as_any(&self) -> &dyn Any;
-
-    /// Get mutable reference to actor state as Any
-    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Typed actor trait for stronger type safety
@@ -234,14 +226,6 @@ mod tests {
     impl Actor<TestMessage> for TestActor {
         fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_messages.push(msg.content);
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
         }
     }
 

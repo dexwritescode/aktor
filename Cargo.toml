@@ -20,6 +20,7 @@ futures = "0.3"
 rand = "0.8"
 rayon = "1.8"
 crossbeam = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 
 # Optional dependencies for test-util feature
 tokio-test = { version = "0.4", optional = true }
