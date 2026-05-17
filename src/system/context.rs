@@ -454,21 +454,24 @@ impl WorkerPool {
                                 }
                             }
 
-                            // Handle the overflow message and decide whether to reschedule.
+                            // Decide whether to reschedule. Clear scheduled=false
+                            // BEFORE the final try_recv so concurrent tell()s that
+                            // arrive in the window see false and push to the queue
+                            // themselves — closing the stuck-message race.
                             if !should_stop {
-                                match actor_entry.receiver.try_recv() {
-                                    Ok(msg) => {
-                                        dispatch(&mut actor_entry, msg);
-                                        if actor_entry.stop_requested.load(Ordering::Acquire) {
-                                            should_stop = true;
-                                        } else {
-                                            work_queue.push(address.clone());
-                                        }
-                                    }
-                                    Err(_) => {
-                                        actor_entry.scheduled.store(false, Ordering::Release);
+                                actor_entry.scheduled.store(false, Ordering::Release);
+                                // A message arrived in the window — reclaim
+                                // the scheduled slot and continue.
+                                if let Ok(msg) = actor_entry.receiver.try_recv() {
+                                    actor_entry.scheduled.store(true, Ordering::Release);
+                                    dispatch(&mut actor_entry, msg);
+                                    if actor_entry.stop_requested.load(Ordering::Acquire) {
+                                        should_stop = true;
+                                    } else {
+                                        work_queue.push(address.clone());
                                     }
                                 }
+                                // Err: truly empty — scheduled stays false
                             }
                         }
 
@@ -1206,6 +1209,63 @@ mod tests {
         assert!(
             system.get_actor(actor_ref.address()).await.is_none(),
             "actor should have been removed from the system after PoisonPill"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_messages_delivered_across_batch_boundary() {
+        // Sends more messages than BATCH_SIZE to exercise the rescheduling tail
+        // and verify no message gets stuck in the scheduled-flag race window.
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        #[derive(Debug)]
+        struct CountingActor {
+            counter: Arc<AtomicUsize>,
+        }
+
+        impl Actor<TestMessage> for CountingActor {
+            fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+                self.counter.fetch_add(1, AOrdering::Relaxed);
+            }
+        }
+
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let actor_ref = system
+            .spawn_actor(
+                "counter",
+                CountingActor {
+                    counter: counter.clone(),
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        // Send 25 messages — forces at least two full batches plus a remainder.
+        const MSG_COUNT: usize = 25;
+        for i in 0..MSG_COUNT {
+            actor_ref
+                .tell(
+                    TestMessage {
+                        data: i.to_string(),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+
+        // Allow enough time for all batches to drain.
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            MSG_COUNT,
+            "all messages must be delivered with no stuck messages"
         );
     }
 }
