@@ -1,6 +1,6 @@
 use aktor::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -26,9 +26,7 @@ struct BenchActor {
 
 impl BenchActor {
     fn new() -> Self {
-        Self {
-            message_count: 0,
-        }
+        Self { message_count: 0 }
     }
 
     /// Simulate light computational work
@@ -100,7 +98,10 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
     println!("=== Aktor Performance Benchmark ===");
     println!("Actors: {}", config.actor_count);
     println!("Messages per actor: {}", config.messages_per_actor);
-    println!("Total messages: {}", config.actor_count * config.messages_per_actor);
+    println!(
+        "Total messages: {}",
+        config.actor_count * config.messages_per_actor
+    );
 
     let _metrics = BenchmarkMetrics::new();
 
@@ -121,11 +122,13 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
             // i
         );
 
-        let actor_ref = system.spawn_actor(
-            &format!("bench-actor-{}", i),
-            actor,
-            ActorProps::new().with_mailbox_size(10000),
-        ).await?;
+        let actor_ref = system
+            .spawn_actor(
+                &format!("bench-actor-{}", i),
+                actor,
+                ActorProps::new().with_mailbox_size(10000),
+            )
+            .await?;
 
         actor_refs.push(actor_ref);
     }
@@ -157,7 +160,10 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
             let mut total_sent = 0u64;
             let mut total_failed = 0u64;
 
-            println!("Sending {} total messages as fast as possible...", total_messages);
+            println!(
+                "Sending {} total messages as fast as possible...",
+                total_messages
+            );
 
             // Send all messages as fast as possible
             for i in 0..total_messages {
@@ -185,7 +191,10 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
 
             // Send final metrics
             let _ = metrics_tx.send((total_sent, total_failed));
-            println!("Message sending complete! Sent: {}, Failed: {}", total_sent, total_failed);
+            println!(
+                "Message sending complete! Sent: {}, Failed: {}",
+                total_sent, total_failed
+            );
         }
     });
 
@@ -205,7 +214,9 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
     let send_rate = final_sent as f64 / elapsed.as_secs_f64();
     let error_rate = if final_sent > 0 {
         final_failed as f64 / (final_sent + final_failed) as f64 * 100.0
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     println!("=== FINAL RESULTS ===");
     println!("Duration: {:.2}s", elapsed.as_secs_f64());
@@ -213,21 +224,36 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
     println!("Messages failed: {}", final_failed);
     println!("Send rate: {:.0} msg/sec", send_rate);
     println!("Error rate: {:.2}%", error_rate);
-    println!("Messages per actor per second: {:.1}", send_rate / config.actor_count as f64);
+    println!(
+        "Messages per actor per second: {:.1}",
+        send_rate / config.actor_count as f64
+    );
 
     // Check how many messages were processed immediately
     let processed_at_send_complete = processed_counter.load(Ordering::Relaxed);
     println!("\n=== PROCESSING STATS ===");
-    println!("Messages processed during sending: {}/{}", processed_at_send_complete, final_sent);
-    println!("Processing rate: {:.1}%", (processed_at_send_complete as f64 / final_sent as f64) * 100.0);
+    println!(
+        "Messages processed during sending: {}/{}",
+        processed_at_send_complete, final_sent
+    );
+    println!(
+        "Processing rate: {:.1}%",
+        (processed_at_send_complete as f64 / final_sent as f64) * 100.0
+    );
 
     // Give time for in-flight messages to be processed
     println!("\nWaiting for remaining message processing...");
     sleep(Duration::from_secs(2)).await;
 
     let final_processed = processed_counter.load(Ordering::Relaxed);
-    println!("Total messages processed: {}/{}", final_processed, final_sent);
-    println!("Final processing rate: {:.1}%", (final_processed as f64 / final_sent as f64) * 100.0);
+    println!(
+        "Total messages processed: {}/{}",
+        final_processed, final_sent
+    );
+    println!(
+        "Final processing rate: {:.1}%",
+        (final_processed as f64 / final_sent as f64) * 100.0
+    );
 
     // Cleanup
     println!("\nShutting down actor system...");

@@ -50,11 +50,7 @@ pub trait TypedActor<M: Message>: Actor<M> {
     type Msg: Message;
 
     /// Type-safe message handling
-    fn receive(
-        &mut self,
-        msg: Self::Msg,
-        ctx: &ActorContext<Self::Msg>
-    );
+    fn receive(&mut self, msg: Self::Msg, ctx: &ActorContext<Self::Msg>);
 }
 
 /// Supervision strategy for handling actor failures
@@ -105,7 +101,7 @@ impl<A> Default for DefaultActorFactory<A> {
 }
 
 /// Args-based actor factory
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ArgsActorFactory<A, Args> {
     _phantom_actor: std::marker::PhantomData<A>,
     _phantom_args: std::marker::PhantomData<Args>,
@@ -192,7 +188,6 @@ impl Default for ActorProps {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

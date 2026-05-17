@@ -151,7 +151,10 @@ impl ActorPath {
 
     /// Check if this is a system path
     pub fn is_system(&self) -> bool {
-        self.segments.first().map(|s| s == "system").unwrap_or(false)
+        self.segments
+            .first()
+            .map(|s| s == "system")
+            .unwrap_or(false)
     }
 
     /// Check if this is a user path
@@ -178,7 +181,8 @@ impl FromStr for ActorAddress {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if !s.starts_with("actor://") {
             return Err(AddressError::InvalidFormat(format!(
-                "Address must start with 'actor://': {}", s
+                "Address must start with 'actor://': {}",
+                s
             )));
         }
 
@@ -187,7 +191,8 @@ impl FromStr for ActorAddress {
 
         if parts.len() != 2 {
             return Err(AddressError::InvalidFormat(format!(
-                "Invalid format, expected 'actor://node_id/path': {}", s
+                "Invalid format, expected 'actor://node_id/path': {}",
+                s
             )));
         }
 
@@ -205,7 +210,8 @@ impl FromStr for ActorPath {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if !s.starts_with('/') {
             return Err(AddressError::InvalidFormat(format!(
-                "Path must start with '/': {}", s
+                "Path must start with '/': {}",
+                s
             )));
         }
 

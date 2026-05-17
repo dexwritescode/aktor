@@ -1,0 +1,24 @@
+name: Release
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: dexwritescode/release-on-merge-action@v1.2.0
+        with:
+          initial-version: '0.1.0'
+          version-increment-strategy: patch
+          generate-release-notes: true
+          use-label-strategy: true
+          label-major: 'release:major'
+          label-minor: 'release:minor'
+          label-patch: 'release:patch'
+          label-skip: 'release:skip'

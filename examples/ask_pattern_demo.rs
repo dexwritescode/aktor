@@ -27,8 +27,6 @@ impl Message for Status {
     }
 }
 
-
-
 // Example actor that can respond to ask pattern requests
 #[derive(Debug)]
 struct StatusActor {
@@ -51,8 +49,11 @@ impl Actor<GetStatus> for StatusActor {
 
         if ctx.is_ask_request() {
             // This is an ask request - send response
-            println!("StatusActor received ask request #{} (correlation: {:?})",
-                     self.message_count, ctx.correlation_id());
+            println!(
+                "StatusActor received ask request #{} (correlation: {:?})",
+                self.message_count,
+                ctx.correlation_id()
+            );
 
             let status = Status {
                 running: true,
@@ -85,7 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn status actor
     let status_actor = StatusActor::default();
-    let actor_ref = system.spawn_actor("status-actor", status_actor, ActorProps::default()).await?;
+    let actor_ref = system
+        .spawn_actor("status-actor", status_actor, ActorProps::default())
+        .await?;
 
     // Give the actor time to start
     sleep(Duration::from_millis(100)).await;
@@ -94,7 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Example 1: Basic ask pattern as shown in the plan
     let message = GetStatus;
-    let future = ask_with_actor_ref::<GetStatus, Status>(&actor_ref, message, Duration::from_secs(5));
+    let future =
+        ask_with_actor_ref::<GetStatus, Status>(&actor_ref, message, Duration::from_secs(5));
 
     match future.await {
         Ok(response) => {
@@ -176,7 +180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let actor_ref = actor_ref.clone();
         tokio::spawn(async move {
             let message = GetStatus;
-            let result: Result<Status, AskError> = actor_ref.ask(message, Duration::from_secs(5)).await;
+            let result: Result<Status, AskError> =
+                actor_ref.ask(message, Duration::from_secs(5)).await;
             (i, result)
         })
     });
@@ -185,7 +190,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok((i, result)) = future.await {
             match result {
                 Ok(response) => {
-                    println!("✅ Concurrent ask #{}: message_count={}", i, response.message_count);
+                    println!(
+                        "✅ Concurrent ask #{}: message_count={}",
+                        i, response.message_count
+                    );
                 }
                 Err(e) => {
                     println!("❌ Concurrent ask #{} failed: {:?}", i, e);
@@ -202,9 +210,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Sending ask message (request-response)...");
     let message = GetStatus;
-    match actor_ref.ask::<Status>(message, Duration::from_secs(5)).await {
+    match actor_ref
+        .ask::<Status>(message, Duration::from_secs(5))
+        .await
+    {
         Ok(response) => {
-            println!("✅ Ask response shows message count: {}", response.message_count);
+            println!(
+                "✅ Ask response shows message count: {}",
+                response.message_count
+            );
         }
         Err(e) => {
             println!("❌ Ask failed: {:?}", e);
@@ -213,6 +227,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Shutdown the system gracefully
     system.shutdown().await?;
-    
+
     Ok(())
 }

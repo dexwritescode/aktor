@@ -44,12 +44,14 @@
 //! }
 //! ```
 
-use crate::{Actor, ActorContext, ActorError, ActorProps, ActorRef, ActorSystem, ActorSystemConfig, Message};
+use crate::{
+    Actor, ActorContext, ActorError, ActorProps, ActorRef, ActorSystem, ActorSystemConfig, Message,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{timeout, sleep};
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 /// Test kit for actor system testing
@@ -79,7 +81,10 @@ impl Clone for TestMessage {
         // We can't clone the boxed Any, so we create a new message with the same metadata
         // This is acceptable for testing purposes where we mainly care about the type information
         Self {
-            content: Box::new(format!("Cloned TestMessage (original type: {})", self.type_name)),
+            content: Box::new(format!(
+                "Cloned TestMessage (original type: {})",
+                self.type_name
+            )),
             type_name: self.type_name,
             id: self.id,
         }
@@ -164,10 +169,7 @@ pub enum ExpectationResult<T> {
         actual: &'static str,
     },
     /// Unexpected message content
-    WrongContent {
-        expected: String,
-        actual: String,
-    },
+    WrongContent { expected: String, actual: String },
 }
 
 impl<T> ExpectationResult<T> {
@@ -182,7 +184,10 @@ impl<T> ExpectationResult<T> {
                 panic!("Expected message of type {} but got {}", expected, actual);
             }
             ExpectationResult::WrongContent { expected, actual } => {
-                panic!("Expected message content '{}' but got '{}'", expected, actual);
+                panic!(
+                    "Expected message content '{}' but got '{}'",
+                    expected, actual
+                );
             }
         }
     }
@@ -202,7 +207,9 @@ impl ActorTestKit {
     /// Create a new test kit with default configuration
     pub async fn new() -> Self {
         let config = ActorSystemConfig::default();
-        let system = ActorSystem::new(config).await.expect("Failed to create test actor system");
+        let system = ActorSystem::new(config)
+            .await
+            .expect("Failed to create test actor system");
 
         Self {
             system,
@@ -212,7 +219,9 @@ impl ActorTestKit {
 
     /// Create a new test kit with custom configuration
     pub async fn with_config(config: ActorSystemConfig) -> Self {
-        let system = ActorSystem::new(config).await.expect("Failed to create test actor system");
+        let system = ActorSystem::new(config)
+            .await
+            .expect("Failed to create test actor system");
 
         Self {
             system,
@@ -230,7 +239,9 @@ impl ActorTestKit {
     where
         A: Actor<TestMessage> + 'static,
     {
-        self.system.spawn_actor(name, actor, ActorProps::default()).await
+        self.system
+            .spawn_actor(name, actor, ActorProps::default())
+            .await
     }
 
     /// Spawn an actor with custom props
@@ -308,11 +319,16 @@ impl<M: Message + 'static> TestProbe<M> {
     where
         M: PartialEq + Clone,
     {
-        self.expect_message_timeout(expected, Duration::from_secs(1)).await
+        self.expect_message_timeout(expected, Duration::from_secs(1))
+            .await
     }
 
     /// Expect a specific message within the specified timeout
-    pub async fn expect_message_timeout(&self, expected: M, timeout_duration: Duration) -> ExpectationResult<M>
+    pub async fn expect_message_timeout(
+        &self,
+        expected: M,
+        timeout_duration: Duration,
+    ) -> ExpectationResult<M>
     where
         M: PartialEq + Clone,
     {
@@ -334,7 +350,8 @@ impl<M: Message + 'static> TestProbe<M> {
                 // Wait a bit before checking again
                 sleep(Duration::from_millis(10)).await;
             }
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(expectation) => expectation,
@@ -344,11 +361,15 @@ impl<M: Message + 'static> TestProbe<M> {
 
     /// Expect any message of type M within the default timeout
     pub async fn expect_any_message(&self) -> ExpectationResult<M> {
-        self.expect_any_message_timeout(Duration::from_secs(1)).await
+        self.expect_any_message_timeout(Duration::from_secs(1))
+            .await
     }
 
     /// Expect any message of type M within the specified timeout
-    pub async fn expect_any_message_timeout(&self, timeout_duration: Duration) -> ExpectationResult<M> {
+    pub async fn expect_any_message_timeout(
+        &self,
+        timeout_duration: Duration,
+    ) -> ExpectationResult<M> {
         let result = timeout(timeout_duration, async {
             loop {
                 {
@@ -360,7 +381,8 @@ impl<M: Message + 'static> TestProbe<M> {
                 // Wait a bit before checking again
                 sleep(Duration::from_millis(10)).await;
             }
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(expectation) => expectation,
@@ -619,7 +641,10 @@ mod tests {
         };
 
         // Send message directly to the probe to test basic functionality
-        probe.actor_ref().tell(TestMessage::new(message.clone()), None).unwrap();
+        probe
+            .actor_ref()
+            .tell(TestMessage::new(message.clone()), None)
+            .unwrap();
 
         // Wait a bit for message processing
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -655,7 +680,9 @@ mod tests {
         };
 
         // Test ask pattern with echo actor
-        let response: Result<TestMessage, _> = echo.ask(TestMessage::new(message.clone()), Duration::from_secs(1)).await;
+        let response: Result<TestMessage, _> = echo
+            .ask(TestMessage::new(message.clone()), Duration::from_secs(1))
+            .await;
 
         match response {
             Ok(response_msg) => {

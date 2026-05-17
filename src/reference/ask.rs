@@ -135,11 +135,11 @@ where
                 if let Ok(response) = envelope.data.downcast::<R>() {
                     return Ok(*response);
                 } else {
-                    return Err(AskError::SerializationError(
-                        format!("Expected type {}, got {}",
-                               std::any::type_name::<R>(),
-                               envelope.type_name)
-                    ));
+                    return Err(AskError::SerializationError(format!(
+                        "Expected type {}, got {}",
+                        std::any::type_name::<R>(),
+                        envelope.type_name
+                    )));
                 }
             }
         }
@@ -148,7 +148,9 @@ where
 
     timeout(timeout_duration, response_future)
         .await
-        .map_err(|_| AskError::Timeout { timeout: timeout_duration })?
+        .map_err(|_| AskError::Timeout {
+            timeout: timeout_duration,
+        })?
 }
 
 /// Future type for ask operations
@@ -166,9 +168,7 @@ where
 {
     let actor_ref = actor_ref.clone();
 
-    Box::pin(async move {
-        ask_with_actor_ref(&actor_ref, message, timeout_duration).await
-    })
+    Box::pin(async move { ask_with_actor_ref(&actor_ref, message, timeout_duration).await })
 }
 
 /// Extension trait for ActorRef to support ask pattern
@@ -190,9 +190,7 @@ impl<M: Message> AskExt<M> for ActorRef<M> {
         R: Message + 'static,
     {
         let actor_ref = self.clone();
-        Box::pin(async move {
-            ask_with_actor_ref(&actor_ref, message, timeout).await
-        })
+        Box::pin(async move { ask_with_actor_ref(&actor_ref, message, timeout).await })
     }
 
     fn ask_default<R>(&self, message: M) -> AskFuture<R>
