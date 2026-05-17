@@ -2,6 +2,7 @@
 mod tests {
     use crate::reference::ask::{AskRequest, ResponseChannel};
     use crate::{Actor, ActorContext, ActorSystem, ActorSystemConfig, Message};
+    use async_trait::async_trait;
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -38,6 +39,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Actor<EchoMessage> for EchoActor {
         fn handle(&mut self, msg: EchoMessage, ctx: &ActorContext<EchoMessage>) {
             self.message_count += 1;

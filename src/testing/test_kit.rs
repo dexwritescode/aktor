@@ -573,6 +573,7 @@ impl<M: Message> MockActorContext<M> {
 mod tests {
     use super::*;
     use crate::{Actor, ActorContext, ActorError, Message};
+    use async_trait::async_trait;
 
     #[derive(Debug, Clone, PartialEq)]
     struct EchoMessage {
@@ -588,6 +589,7 @@ mod tests {
     #[derive(Debug)]
     struct EchoActor;
 
+    #[async_trait]
     impl Actor<TestMessage> for EchoActor {
         fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
             if let Some(echo_msg) = msg.extract::<EchoMessage>() {

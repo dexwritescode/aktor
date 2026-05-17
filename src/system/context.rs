@@ -618,7 +618,7 @@ impl<M: Message> ActorSystem<M> {
         ));
 
         // Call pre_start
-        if let Err(e) = actor.pre_start(&context) {
+        if let Err(e) = actor.pre_start(&context).await {
             return Err(ActorError::ActorCreationFailed(format!(
                 "Actor pre_start failed: {}",
                 e
@@ -794,6 +794,7 @@ impl<M: Message> ActorSystem<M> {
 mod tests {
     use super::*;
     use crate::{Actor, ActorError, Message};
+    use async_trait::async_trait;
 
     #[derive(Debug, Clone)]
     struct TestMessage {
@@ -821,6 +822,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Actor<TestMessage> for TestActor {
         fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_count += 1;
@@ -893,6 +895,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Actor<TestMessage> for ParameterizedActor {
         fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.messages.push(format!("{}: {}", self.name, msg.data));
@@ -1093,10 +1096,11 @@ mod tests {
         captured: Arc<std::sync::Mutex<Option<String>>>,
     }
 
+    #[async_trait]
     impl Actor<TestMessage> for ParentProbeActor {
         fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
 
-        fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+        async fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
             *self.captured.lock().unwrap() = ctx.parent().map(|p| p.address().to_string());
             Ok(())
         }
@@ -1148,7 +1152,7 @@ mod tests {
             .await
             .unwrap();
 
-        // pre_start runs synchronously inside spawn_actor_with_address, so
+        // pre_start is awaited inside spawn_actor_with_address, so
         // the captured value is set before the call returns.
         assert_eq!(
             *captured.lock().unwrap(),
@@ -1160,6 +1164,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct SelfStoppingActor;
 
+    #[async_trait]
     impl Actor<TestMessage> for SelfStoppingActor {
         fn handle(&mut self, _msg: TestMessage, ctx: &ActorContext<TestMessage>) {
             ctx.stop_self();
@@ -1225,6 +1230,7 @@ mod tests {
             counter: Arc<AtomicUsize>,
         }
 
+        #[async_trait]
         impl Actor<TestMessage> for CountingActor {
             fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
                 self.counter.fetch_add(1, AOrdering::Relaxed);
@@ -1266,6 +1272,63 @@ mod tests {
             counter.load(AOrdering::Relaxed),
             MSG_COUNT,
             "all messages must be delivered with no stuck messages"
+        );
+    }
+
+    // Actor that performs real async work in pre_start and records the result
+    // so tests can verify it completed before the first message was dispatched.
+    #[derive(Debug)]
+    struct AsyncPreStartActor {
+        initialized: Arc<std::sync::Mutex<bool>>,
+        pre_start_child_address: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl Actor<TestMessage> for AsyncPreStartActor {
+        fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
+
+        async fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+            // Async work: yield to the runtime to prove we can await.
+            tokio::task::yield_now().await;
+            *self.initialized.lock().unwrap() = true;
+
+            // Spawn a child in pre_start — the canonical muse use case.
+            let child = ctx.spawn_child("child", TestActor::default(), None).await?;
+            *self.pre_start_child_address.lock().unwrap() = Some(child.address().to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_pre_start_runs_before_first_message() {
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let initialized = Arc::new(std::sync::Mutex::new(false));
+        let child_addr = Arc::new(std::sync::Mutex::new(None::<String>));
+
+        system
+            .spawn_actor(
+                "async-init",
+                AsyncPreStartActor {
+                    initialized: initialized.clone(),
+                    pre_start_child_address: child_addr.clone(),
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        // pre_start is awaited inside spawn_actor_with_address, so both
+        // effects are visible before the call returns.
+        assert!(
+            *initialized.lock().unwrap(),
+            "pre_start async work must complete before spawn returns"
+        );
+        assert!(
+            child_addr.lock().unwrap().is_some(),
+            "child spawned in async pre_start must be registered before spawn returns"
         );
     }
 }
