@@ -1,7 +1,7 @@
 use crate::core::{Actor, ActorError, ActorFactoryArgs, ActorProps, Message};
 use crate::reference::{ActorRef, ResponseEnvelope};
 use crate::system::{
-    ActorAddress,
+    ActorAddress, SystemMessage,
     extension::{Extension, ExtensionRegistry},
 };
 use dashmap::DashMap;
@@ -66,6 +66,10 @@ pub struct ActorContext<M: Message> {
     props: ActorProps,
     /// Response capability (only present during ask requests)
     response_capability: Option<Arc<ResponseCapability>>,
+    /// Set by stop_self() to signal the worker loop to tear down this actor.
+    /// Always local: an actor can only stop itself from within its own handle(),
+    /// so this flag never needs to cross a process boundary.
+    stop_requested: Arc<AtomicBool>,
 }
 
 /// Worker pool for high-performance actor message processing
@@ -80,10 +84,14 @@ struct ActorData<M: Message> {
     actor: Box<dyn Actor<M>>,
     /// Actor context
     context: Arc<ActorContext<M>>,
-    /// Message receiver
+    /// User message receiver
     receiver: mpsc::UnboundedReceiver<crate::reference::ActorMessage<M>>,
+    /// System message receiver (PoisonPill, Watch, etc.)
+    system_receiver: mpsc::UnboundedReceiver<SystemMessage>,
     /// Flag to prevent duplicate scheduling in work queue
     scheduled: Arc<AtomicBool>,
+    /// Shared with ActorContext — set by stop_self() or the worker on PoisonPill
+    stop_requested: Arc<AtomicBool>,
 }
 
 /// Actor system manages the lifecycle of all actors
@@ -141,6 +149,7 @@ impl<M: Message> ActorContext<M> {
         system: Arc<ActorSystem<M>>,
         parent: Option<ActorRef<M>>,
         props: ActorProps,
+        stop_requested: Arc<AtomicBool>,
     ) -> Self {
         Self {
             actor_ref,
@@ -149,6 +158,7 @@ impl<M: Message> ActorContext<M> {
             parent,
             props,
             response_capability: None,
+            stop_requested,
         }
     }
 
@@ -159,6 +169,7 @@ impl<M: Message> ActorContext<M> {
         parent: Option<ActorRef<M>>,
         props: ActorProps,
         response_capability: ResponseCapability,
+        stop_requested: Arc<AtomicBool>,
     ) -> Self {
         Self {
             actor_ref,
@@ -167,6 +178,7 @@ impl<M: Message> ActorContext<M> {
             parent,
             props,
             response_capability: Some(Arc::new(response_capability)),
+            stop_requested,
         }
     }
 
@@ -191,6 +203,12 @@ impl<M: Message> ActorContext<M> {
         self.response_capability
             .as_ref()
             .map(|cap| cap.correlation_id)
+    }
+
+    /// Signal the worker loop to stop this actor after the current message returns.
+    /// Only valid inside handle() — has no effect if called from other contexts.
+    pub fn stop_self(&self) {
+        self.stop_requested.store(true, Ordering::Release);
     }
 
     /// Get reference to this actor
@@ -341,23 +359,23 @@ impl<M: Message> ActorContext<M> {
 }
 
 impl WorkerPool {
-    /// Create a new worker pool with work-stealing architecture
     fn new<M: Message>(
         worker_count: usize,
         actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
+        actors: Arc<DashMap<ActorAddress, ActorRef<M>>>,
         work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::new();
 
-        // Start worker tasks
         for worker_id in 0..worker_count {
             let storage = actor_storage.clone();
+            let actors = actors.clone();
             let queue = work_queue.clone();
             let shutdown_signal = shutdown.clone();
 
             let worker = tokio::spawn(async move {
-                Self::worker_loop(worker_id, storage, queue, shutdown_signal).await;
+                Self::worker_loop(worker_id, storage, actors, queue, shutdown_signal).await;
             });
 
             workers.push(worker);
@@ -366,74 +384,28 @@ impl WorkerPool {
         Self { shutdown }
     }
 
-    /// Worker loop with work-stealing - only processes actors with pending messages
     async fn worker_loop<M: Message>(
         worker_id: usize,
         actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
+        actors: Arc<DashMap<ActorAddress, ActorRef<M>>>,
         work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
         shutdown: Arc<AtomicBool>,
     ) {
         info!("Worker {} started", worker_id);
-        const BATCH_SIZE: usize = 10; // Process up to 10 messages per actor before re-scheduling
+        // TODO aktor-0sm: move to ActorSystemConfig::throughput
+        const BATCH_SIZE: usize = 10;
 
         while !shutdown.load(Ordering::Relaxed) {
-            // Try to steal an actor address from the work queue
             match work_queue.steal() {
                 crossbeam::deque::Steal::Success(address) => {
-                    // Get mutable access to the actor
                     if let Some(mut actor_entry) = actor_storage.get_mut(&address) {
-                        let mut processed = 0;
-
-                        // Clone context Arc to avoid borrow checker issues
                         let context = actor_entry.context.clone();
 
-                        // Process messages in batches for better cache locality
-                        while processed < BATCH_SIZE {
-                            match actor_entry.receiver.try_recv() {
-                                Ok(message) => {
-                                    match message {
-                                        crate::reference::ActorMessage::Tell {
-                                            message,
-                                            sender: _,
-                                        } => {
-                                            // Process tell message synchronously
-                                            actor_entry.actor.handle(message, &context);
-                                        }
-                                        crate::reference::ActorMessage::Ask {
-                                            request,
-                                            message_id: _,
-                                            timestamp: _,
-                                        } => {
-                                            // Create ask context with response capability
-                                            let response_capability = ResponseCapability::new(
-                                                request.correlation_id,
-                                                request.response_to.sender,
-                                            );
-
-                                            let ask_context =
-                                                ActorContext::with_response_capability(
-                                                    context.actor_ref.clone(),
-                                                    context.system.clone(),
-                                                    context.parent.clone(),
-                                                    context.props.clone(),
-                                                    response_capability,
-                                                );
-
-                                            // Process ask message synchronously
-                                            actor_entry.actor.handle(request.message, &ask_context);
-                                        }
-                                    }
-                                    processed += 1;
-                                }
-                                Err(_) => break, // No more messages for this actor
-                            }
-                        }
-
-                        // Re-schedule actor if more messages remain
-                        match actor_entry.receiver.try_recv() {
-                            Ok(message) => {
-                                // Put the message back (we can't, so just process it)
-                                match message {
+                        // Dispatch one user message, building an ask context when needed.
+                        let dispatch =
+                            |actor_entry: &mut ActorData<M>,
+                             msg: crate::reference::ActorMessage<M>| {
+                                match msg {
                                     crate::reference::ActorMessage::Tell { message, sender: _ } => {
                                         actor_entry.actor.handle(message, &context);
                                     }
@@ -442,37 +414,81 @@ impl WorkerPool {
                                         message_id: _,
                                         timestamp: _,
                                     } => {
-                                        let response_capability = ResponseCapability::new(
-                                            request.correlation_id,
-                                            request.response_to.sender,
-                                        );
-                                        let ask_context = ActorContext::with_response_capability(
+                                        let ask_ctx = ActorContext::with_response_capability(
                                             context.actor_ref.clone(),
                                             context.system.clone(),
                                             context.parent.clone(),
                                             context.props.clone(),
-                                            response_capability,
+                                            ResponseCapability::new(
+                                                request.correlation_id,
+                                                request.response_to.sender,
+                                            ),
+                                            context.stop_requested.clone(),
                                         );
-                                        actor_entry.actor.handle(request.message, &ask_context);
+                                        actor_entry.actor.handle(request.message, &ask_ctx);
                                     }
                                 }
-                                // Re-push to queue if there might be more messages
-                                work_queue.push(address);
+                            };
+
+                        // Check system channel first — PoisonPill takes priority over
+                        // user messages. TODO aktor-aqz: becomes a drain loop that
+                        // continues on Watch/Unwatch and breaks on PoisonPill.
+                        let mut should_stop = matches!(
+                            actor_entry.system_receiver.try_recv(),
+                            Ok(SystemMessage::PoisonPill)
+                        );
+
+                        if !should_stop {
+                            let mut processed = 0;
+                            while processed < BATCH_SIZE {
+                                match actor_entry.receiver.try_recv() {
+                                    Ok(msg) => {
+                                        dispatch(&mut actor_entry, msg);
+                                        processed += 1;
+                                        if actor_entry.stop_requested.load(Ordering::Acquire) {
+                                            should_stop = true;
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
                             }
-                            Err(_) => {
-                                // No more messages - clear scheduled flag
-                                actor_entry.scheduled.store(false, Ordering::Release);
+
+                            // Handle the overflow message and decide whether to reschedule.
+                            if !should_stop {
+                                match actor_entry.receiver.try_recv() {
+                                    Ok(msg) => {
+                                        dispatch(&mut actor_entry, msg);
+                                        if actor_entry.stop_requested.load(Ordering::Acquire) {
+                                            should_stop = true;
+                                        } else {
+                                            work_queue.push(address.clone());
+                                        }
+                                    }
+                                    Err(_) => {
+                                        actor_entry.scheduled.store(false, Ordering::Release);
+                                    }
+                                }
                             }
+                        }
+
+                        if should_stop {
+                            if let Err(e) = actor_entry.actor.post_stop(&context) {
+                                error!("Actor post_stop failed for {}: {}", address, e);
+                            }
+                            // Drop RefMut before removing to avoid DashMap deadlock.
+                            drop(actor_entry);
+                            actor_storage.remove(&address);
+                            actors.remove(&address);
+                            info!("Actor stopped: {}", address);
                         }
                     }
                 }
                 crossbeam::deque::Steal::Empty => {
-                    // No work available - yield briefly
                     tokio::task::yield_now().await;
                     tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
                 }
                 crossbeam::deque::Steal::Retry => {
-                    // Retry immediately
                     continue;
                 }
             }
@@ -508,7 +524,12 @@ impl<M: Message> ActorSystem<M> {
 
         // Automatically start worker pool
         let worker_count = config.thread_pool_size;
-        let worker_pool = WorkerPool::new(worker_count, actor_storage, work_queue);
+        let worker_pool = WorkerPool::new(
+            worker_count,
+            actor_storage,
+            system.actors.clone(),
+            work_queue,
+        );
         *system.worker_pool.write().await = Some(worker_pool);
 
         info!(
@@ -566,8 +587,9 @@ impl<M: Message> ActorSystem<M> {
             )));
         }
 
-        // Create message channel for this actor
+        // Create user and system message channels for this actor
         let (sender, receiver) = mpsc::unbounded_channel();
+        let (system_sender, system_receiver) = mpsc::unbounded_channel::<SystemMessage>();
 
         // Create actor reference
         let mut actor_ref = ActorRef::new_local(address.clone(), sender);
@@ -575,8 +597,13 @@ impl<M: Message> ActorSystem<M> {
         // Create scheduled flag for reactive scheduling
         let scheduled = Arc::new(AtomicBool::new(false));
 
-        // Set up reactive scheduling on the actor reference
+        // Set up reactive scheduling and system channel on the actor reference
         actor_ref.set_scheduling(self.work_queue.clone(), scheduled.clone());
+        actor_ref.set_system_sender(system_sender);
+
+        // Stop flag shared between ActorContext (written by stop_self) and
+        // ActorData (read by the worker loop after each handle() call)
+        let stop_requested = Arc::new(AtomicBool::new(false));
 
         // Create actor context
         let context = Arc::new(ActorContext::new(
@@ -584,6 +611,7 @@ impl<M: Message> ActorSystem<M> {
             self.clone(),
             parent,
             props.clone(),
+            stop_requested.clone(),
         ));
 
         // Call pre_start
@@ -599,7 +627,9 @@ impl<M: Message> ActorSystem<M> {
             actor: Box::new(actor),
             context,
             receiver,
+            system_receiver,
             scheduled,
+            stop_requested,
         };
 
         // Insert into DashMap (no need for write lock)
@@ -1120,6 +1150,62 @@ mod tests {
         assert_eq!(
             *captured.lock().unwrap(),
             Some(parent_ref.address().to_string())
+        );
+    }
+
+    // Actor that calls ctx.stop_self() on the first message it handles.
+    #[derive(Debug, Default)]
+    struct SelfStoppingActor;
+
+    impl Actor<TestMessage> for SelfStoppingActor {
+        fn handle(&mut self, _msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+            ctx.stop_self();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stop_self_removes_actor_from_system() {
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let actor_ref = system
+            .spawn_actor("self-stopper", SelfStoppingActor, ActorProps::default())
+            .await
+            .unwrap();
+
+        actor_ref
+            .tell(TestMessage { data: "go".into() }, None)
+            .unwrap();
+
+        // Give the worker loop time to process the message and clean up.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert!(
+            system.get_actor(actor_ref.address()).await.is_none(),
+            "actor should have been removed from the system after stop_self()"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poison_pill_removes_actor_from_system() {
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let actor_ref = system
+            .spawn_actor("pill-target", TestActor::default(), ActorProps::default())
+            .await
+            .unwrap();
+
+        actor_ref.stop().await.unwrap();
+
+        // Give the worker loop time to process the PoisonPill and clean up.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert!(
+            system.get_actor(actor_ref.address()).await.is_none(),
+            "actor should have been removed from the system after PoisonPill"
         );
     }
 }
