@@ -40,7 +40,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl Actor<EchoMessage> for EchoActor {
+    impl Actor for EchoActor {
+        type Msg = EchoMessage;
+
         fn handle(&mut self, msg: EchoMessage, ctx: &ActorContext<EchoMessage>) {
             self.message_count += 1;
 

@@ -43,7 +43,9 @@ impl Default for StatusActor {
     }
 }
 
-impl Actor<GetStatus> for StatusActor {
+impl Actor for StatusActor {
+    type Msg = GetStatus;
+
     fn handle(&mut self, _msg: GetStatus, ctx: &ActorContext<GetStatus>) {
         self.message_count += 1;
 

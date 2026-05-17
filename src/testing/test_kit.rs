@@ -60,7 +60,7 @@ use uuid::Uuid;
 /// Similar to Akka's ActorTestKit but designed for Rust.
 pub struct ActorTestKit {
     /// The underlying actor system
-    system: Arc<ActorSystem<TestMessage>>,
+    system: Arc<ActorSystem>,
     /// Test probes created by this test kit
     probes: Arc<RwLock<Vec<Arc<dyn TestProbeRef>>>>,
 }
@@ -230,30 +230,28 @@ impl ActorTestKit {
     }
 
     /// Get the underlying actor system
-    pub fn system(&self) -> &Arc<ActorSystem<TestMessage>> {
+    pub fn system(&self) -> &Arc<ActorSystem> {
         &self.system
     }
 
     /// Spawn an actor in the test environment
-    pub async fn spawn<A>(&self, actor: A, name: &str) -> Result<ActorRef<TestMessage>, ActorError>
-    where
-        A: Actor<TestMessage> + 'static,
-    {
+    pub async fn spawn<A: Actor>(
+        &self,
+        actor: A,
+        name: &str,
+    ) -> Result<ActorRef<A::Msg>, ActorError> {
         self.system
             .spawn_actor(name, actor, ActorProps::default())
             .await
     }
 
     /// Spawn an actor with custom props
-    pub async fn spawn_with_props<A>(
+    pub async fn spawn_with_props<A: Actor>(
         &self,
         actor: A,
         name: &str,
         props: ActorProps,
-    ) -> Result<ActorRef<TestMessage>, ActorError>
-    where
-        A: Actor<TestMessage> + 'static,
-    {
+    ) -> Result<ActorRef<A::Msg>, ActorError> {
         self.system.spawn_actor(name, actor, props).await
     }
 
@@ -434,7 +432,9 @@ struct TestProbeActor<M: Message> {
     message_type: std::marker::PhantomData<M>,
 }
 
-impl<M: Message + 'static> Actor<TestMessage> for TestProbeActor<M> {
+impl<M: Message + 'static> Actor for TestProbeActor<M> {
+    type Msg = TestMessage;
+
     fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
         // Try to extract the message as type M and clone it immediately
         if let Some(typed_message) = msg.extract::<M>().cloned() {
@@ -590,7 +590,9 @@ mod tests {
     struct EchoActor;
 
     #[async_trait]
-    impl Actor<TestMessage> for EchoActor {
+    impl Actor for EchoActor {
+        type Msg = TestMessage;
+
         fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
             if let Some(echo_msg) = msg.extract::<EchoMessage>() {
                 if ctx.is_ask_request() {

@@ -2,45 +2,40 @@ use crate::{ActorContext, ActorError, Message};
 use async_trait::async_trait;
 
 /// Core trait that all actors must implement.
-/// Generic over the message type for type safety.
+///
+/// Each actor declares its message type via `type Msg`. The runtime dispatches
+/// only that type to the actor, giving compile-time message-type safety without
+/// forcing the actor system to be generic over `M`.
 ///
 /// `handle` is synchronous — use `ctx.pipe_to_self(future)` for async I/O.
 /// `pre_start` is async and runs before the first message is dispatched.
 #[async_trait]
-pub trait Actor<M: Message>: Send + Sync + std::fmt::Debug + 'static {
+pub trait Actor: Send + Sync + std::fmt::Debug + 'static {
+    type Msg: Message;
+
     /// Handle incoming messages (both Tell and Ask).
     ///
     /// For Ask messages: use `ctx.is_ask_request()` and `ctx.respond(response)`.
     /// For async I/O: use `ctx.pipe_to_self(future)` — handle returns immediately
     /// and the future result arrives as a subsequent message.
-    fn handle(&mut self, msg: M, ctx: &ActorContext<M>);
+    fn handle(&mut self, msg: Self::Msg, ctx: &ActorContext<Self::Msg>);
 
     /// Called once before the first message is dispatched.
     /// Spawn children, open connections, or load initial state here.
-    async fn pre_start(&mut self, _ctx: &ActorContext<M>) -> Result<(), ActorError> {
+    async fn pre_start(&mut self, _ctx: &ActorContext<Self::Msg>) -> Result<(), ActorError> {
         Ok(())
     }
 
     /// Called when the actor is shutting down. Use for cleanup.
-    fn post_stop(&mut self, _ctx: &ActorContext<M>) -> Result<(), ActorError> {
+    fn post_stop(&mut self, _ctx: &ActorContext<Self::Msg>) -> Result<(), ActorError> {
         Ok(())
     }
 
     /// Called when the actor encounters an error. Return true to restart, false to stop.
-    fn on_error(&mut self, error: &ActorError, _ctx: &ActorContext<M>) -> bool {
+    fn on_error(&mut self, error: &ActorError, _ctx: &ActorContext<Self::Msg>) -> bool {
         tracing::error!("Actor error: {}", error);
         false
     }
-}
-
-/// Typed actor trait for stronger type safety
-/// This ensures actors can only receive their specific message type
-pub trait TypedActor<M: Message>: Actor<M> {
-    /// The specific message type this actor handles
-    type Msg: Message;
-
-    /// Type-safe message handling
-    fn receive(&mut self, msg: Self::Msg, ctx: &ActorContext<Self::Msg>);
 }
 
 /// Supervision strategy for handling actor failures
@@ -57,7 +52,7 @@ pub enum SupervisionStrategy {
 }
 
 /// Factory trait for actors that can be created with arguments
-pub trait ActorFactoryArgs<M: Message, Args: Send + 'static>: Actor<M> + Sized {
+pub trait ActorFactoryArgs<Args: Send + 'static>: Actor + Sized {
     /// Create actor with arguments
     fn create_args(args: Args) -> Self;
 }
@@ -75,10 +70,9 @@ impl<A> DefaultActorFactory<A> {
         }
     }
 
-    pub fn create_actor<M>(&self) -> A
+    pub fn create_actor(&self) -> A
     where
-        A: Actor<M> + Default,
-        M: Message,
+        A: Actor + Default,
     {
         A::default()
     }
@@ -105,10 +99,9 @@ impl<A, Args> ArgsActorFactory<A, Args> {
         }
     }
 
-    pub fn create_actor<M>(&self, args: Args) -> A
+    pub fn create_actor(&self, args: Args) -> A
     where
-        A: ActorFactoryArgs<M, Args>,
-        M: Message,
+        A: ActorFactoryArgs<Args>,
         Args: Send + 'static,
     {
         A::create_args(args)
@@ -132,32 +125,26 @@ pub struct ActorProps {
     pub dispatcher: Option<String>,
 }
 
-/// Enhanced ActorProps with builder pattern
 impl ActorProps {
-    /// Create new ActorProps
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set mailbox size
     pub fn with_mailbox_size(mut self, size: usize) -> Self {
         self.mailbox_size = size;
         self
     }
 
-    /// Set dispatcher
     pub fn with_dispatcher(mut self, dispatcher: impl Into<String>) -> Self {
         self.dispatcher = Some(dispatcher.into());
         self
     }
 
-    /// Set supervision strategy
     pub fn with_supervision(mut self, strategy: SupervisionStrategy) -> Self {
         self.supervision_strategy = strategy;
         self
     }
 
-    /// Enable restart on failure
     pub fn with_restart(mut self, max_restarts: u32, window_secs: u64) -> Self {
         self.restart_on_failure = true;
         self.max_restarts = max_restarts;
@@ -209,7 +196,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl Actor<TestMessage> for TestActor {
+    impl Actor for TestActor {
+        type Msg = TestMessage;
+
         fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_messages.push(msg.content);
         }
@@ -234,8 +223,6 @@ mod tests {
             content: "test message".to_string(),
         };
 
-        // Mock context - we don't actually use it in this test
-        // but we need it for the Actor trait
         assert_eq!(actor.received_messages.len(), 0);
         assert_eq!(message.content, "test message");
         assert_eq!(Message::type_id(&message), "TestMessage");

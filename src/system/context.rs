@@ -14,9 +14,7 @@ use uuid::Uuid;
 
 /// Response capability for ask pattern - embedded in context during ask handling
 pub(crate) struct ResponseCapability {
-    /// Correlation ID for this ask request
     pub correlation_id: Uuid,
-    /// Channel to send response back
     sender: mpsc::UnboundedSender<ResponseEnvelope>,
 }
 
@@ -31,7 +29,6 @@ impl ResponseCapability {
         }
     }
 
-    /// Send a response back through this capability
     pub(crate) async fn send_response<R: Message + 'static>(
         &self,
         response: R,
@@ -41,91 +38,257 @@ impl ResponseCapability {
             type_name: std::any::type_name::<R>(),
             correlation_id: self.correlation_id,
         };
-
         self.sender.send(envelope).map_err(|_| {
             ActorError::MessageDeliveryFailed("Response channel closed".to_string())
         })?;
-
         Ok(())
     }
 }
 
-/// Actor context provides the runtime environment for an actor
-/// This is passed to actors during message handling and lifecycle events
+/// Type-erased handle used for the children map.
+/// Allows a parent actor to stop children regardless of their message type.
+pub(crate) trait AnyActorRef: Send + Sync {
+    fn stop_now(&self) -> Result<(), ActorError>;
+}
+
+impl<M: Message> AnyActorRef for ActorRef<M> {
+    fn stop_now(&self) -> Result<(), ActorError> {
+        self.stop_sync()
+    }
+}
+
+/// Actor context provides the runtime environment for an actor.
+/// Parameterised on the message type `M`, not on the actor type, so it can be
+/// freely cloned and passed without the caller knowing the concrete actor type.
 #[derive(Clone)]
 pub struct ActorContext<M: Message> {
-    /// Reference to this actor
     pub actor_ref: ActorRef<M>,
-    /// Reference to the actor system
-    pub system: Arc<ActorSystem<M>>,
-    /// Child actors spawned by this actor
-    children: Arc<RwLock<HashMap<String, ActorRef<M>>>>,
-    /// Parent actor reference (if this is a child actor)
-    parent: Option<ActorRef<M>>,
-    /// Actor properties and configuration
+    /// Reference to the non-generic actor system.
+    pub system: Arc<ActorSystem>,
+    /// Children spawned by this actor (type-erased for heterogeneous message types).
+    children: Arc<RwLock<HashMap<String, Box<dyn AnyActorRef>>>>,
+    /// Parent actor address (if this is a child actor).
+    parent: Option<ActorAddress>,
     props: ActorProps,
-    /// Response capability (only present during ask requests)
     response_capability: Option<Arc<ResponseCapability>>,
     /// Set by stop_self() to signal the worker loop to tear down this actor.
-    /// Always local: an actor can only stop itself from within its own handle(),
-    /// so this flag never needs to cross a process boundary.
     stop_requested: Arc<AtomicBool>,
 }
 
-/// Worker pool for high-performance actor message processing
+// ------------------------------------------------------------------
+// Type-erased dispatch layer
+// ------------------------------------------------------------------
+
+enum RunResult {
+    Idle,
+    Stop,
+}
+
+/// Type-erased interface used by the worker loop to drive any actor.
+trait ActorRunner: Send + Sync {
+    fn run_batch(&mut self, batch_size: usize) -> RunResult;
+    fn do_post_stop(&mut self);
+}
+
+/// Concrete typed runner — owns the actor, its context, and its mailbox.
+struct ActorRunnerImpl<A: Actor> {
+    actor: A,
+    context: Arc<ActorContext<A::Msg>>,
+    receiver: mpsc::UnboundedReceiver<crate::reference::ActorMessage<A::Msg>>,
+    system_receiver: mpsc::UnboundedReceiver<SystemMessage>,
+    scheduled: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
+    address: ActorAddress,
+    work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
+}
+
+impl<A: Actor> ActorRunnerImpl<A> {
+    fn dispatch_one(&mut self, msg: crate::reference::ActorMessage<A::Msg>) {
+        let ctx = Arc::clone(&self.context);
+        match msg {
+            crate::reference::ActorMessage::Tell { message, sender: _ } => {
+                self.actor.handle(message, &ctx);
+            }
+            crate::reference::ActorMessage::Ask {
+                request,
+                message_id: _,
+                timestamp: _,
+            } => {
+                let ask_ctx = ActorContext {
+                    actor_ref: ctx.actor_ref.clone(),
+                    system: ctx.system.clone(),
+                    children: ctx.children.clone(),
+                    parent: ctx.parent.clone(),
+                    props: ctx.props.clone(),
+                    response_capability: Some(Arc::new(ResponseCapability::new(
+                        request.correlation_id,
+                        request.response_to.sender,
+                    ))),
+                    stop_requested: ctx.stop_requested.clone(),
+                };
+                self.actor.handle(request.message, &ask_ctx);
+            }
+        }
+    }
+}
+
+impl<A: Actor> ActorRunner for ActorRunnerImpl<A> {
+    fn run_batch(&mut self, batch_size: usize) -> RunResult {
+        // Check system channel first — PoisonPill takes priority over user messages.
+        let mut should_stop = matches!(
+            self.system_receiver.try_recv(),
+            Ok(SystemMessage::PoisonPill)
+        );
+
+        if !should_stop {
+            let mut processed = 0;
+            while processed < batch_size {
+                match self.receiver.try_recv() {
+                    Ok(msg) => {
+                        self.dispatch_one(msg);
+                        processed += 1;
+                        if self.stop_requested.load(Ordering::Acquire) {
+                            should_stop = true;
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Rescheduling race-fix: clear scheduled BEFORE the final try_recv
+            // so concurrent tell()s that arrive in the window push to the queue
+            // themselves — closing the stuck-message race.
+            if !should_stop {
+                self.scheduled.store(false, Ordering::Release);
+                if let Ok(msg) = self.receiver.try_recv() {
+                    self.scheduled.store(true, Ordering::Release);
+                    self.dispatch_one(msg);
+                    if self.stop_requested.load(Ordering::Acquire) {
+                        should_stop = true;
+                    } else {
+                        self.work_queue.push(self.address.clone());
+                    }
+                }
+                // Err: truly empty — scheduled stays false
+            }
+        }
+
+        if should_stop {
+            RunResult::Stop
+        } else {
+            RunResult::Idle
+        }
+    }
+
+    fn do_post_stop(&mut self) {
+        if let Err(e) = self.actor.post_stop(&self.context) {
+            error!("Actor post_stop failed for {}: {}", self.address, e);
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Worker pool
+// ------------------------------------------------------------------
+
 struct WorkerPool {
-    /// Shutdown signal
     shutdown: Arc<AtomicBool>,
 }
 
-/// Actor storage in the worker pool
-struct ActorData<M: Message> {
-    /// The actor instance
-    actor: Box<dyn Actor<M>>,
-    /// Actor context
-    context: Arc<ActorContext<M>>,
-    /// User message receiver
-    receiver: mpsc::UnboundedReceiver<crate::reference::ActorMessage<M>>,
-    /// System message receiver (PoisonPill, Watch, etc.)
-    system_receiver: mpsc::UnboundedReceiver<SystemMessage>,
-    /// Flag to prevent duplicate scheduling in work queue
-    scheduled: Arc<AtomicBool>,
-    /// Shared with ActorContext — set by stop_self() or the worker on PoisonPill
-    stop_requested: Arc<AtomicBool>,
+impl WorkerPool {
+    fn new(
+        worker_count: usize,
+        actor_storage: Arc<DashMap<ActorAddress, Box<dyn ActorRunner>>>,
+        work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
+    ) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        for worker_id in 0..worker_count {
+            let storage = actor_storage.clone();
+            let queue = work_queue.clone();
+            let shutdown_signal = shutdown.clone();
+
+            tokio::spawn(async move {
+                Self::worker_loop(worker_id, storage, queue, shutdown_signal).await;
+            });
+        }
+
+        Self { shutdown }
+    }
+
+    async fn worker_loop(
+        worker_id: usize,
+        actor_storage: Arc<DashMap<ActorAddress, Box<dyn ActorRunner>>>,
+        work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        info!("Worker {} started", worker_id);
+        // TODO aktor-0sm: move to ActorSystemConfig::throughput
+        const BATCH_SIZE: usize = 10;
+
+        while !shutdown.load(Ordering::Relaxed) {
+            match work_queue.steal() {
+                crossbeam::deque::Steal::Success(address) => {
+                    let should_stop = {
+                        let guard = actor_storage.get_mut(&address);
+                        if let Some(mut runner) = guard {
+                            let stop = matches!(runner.run_batch(BATCH_SIZE), RunResult::Stop);
+                            if stop {
+                                runner.do_post_stop();
+                            }
+                            stop
+                        } else {
+                            false
+                        }
+                    }; // RefMut released before remove
+                    if should_stop {
+                        actor_storage.remove(&address);
+                        info!("Actor stopped: {}", address);
+                    }
+                }
+                crossbeam::deque::Steal::Empty => {
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+                }
+                crossbeam::deque::Steal::Retry => {
+                    continue;
+                }
+            }
+        }
+
+        info!("Worker {} stopped", worker_id);
+    }
+
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
 }
 
-/// Actor system manages the lifecycle of all actors
-pub struct ActorSystem<M: Message> {
-    /// System configuration
+// ------------------------------------------------------------------
+// Actor system
+// ------------------------------------------------------------------
+
+/// The actor system. No longer generic over a message type — actors with
+/// different `type Msg` can all coexist in the same system.
+pub struct ActorSystem {
     config: ActorSystemConfig,
-    /// All actors in the system by address
-    actors: Arc<DashMap<ActorAddress, ActorRef<M>>>,
-    /// Node ID for this actor system instance
     node_id: String,
-    /// Worker pool for processing actor messages
     worker_pool: Arc<RwLock<Option<WorkerPool>>>,
-    /// Actor storage (actors + contexts + receivers) - DashMap for fine-grained locking
-    actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
-    /// Work-stealing queue for reactive scheduling
+    /// Type-erased per-actor state (actor + mailbox + context).
+    actor_storage: Arc<DashMap<ActorAddress, Box<dyn ActorRunner>>>,
     work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
-    /// Extension registry for shared resources (HTTP clients, DB pools, etc.)
-    extensions: Arc<crate::system::extension::ExtensionRegistry>,
+    extensions: Arc<ExtensionRegistry>,
 }
 
 /// Configuration for the actor system
 #[derive(Debug, Clone)]
 pub struct ActorSystemConfig {
-    /// Maximum number of actors in the system
     pub max_actors: usize,
-    /// Default message mailbox size
     pub default_mailbox_size: usize,
-    /// Enable distributed mode
     pub distributed: bool,
-    /// Network bind address for distributed mode
     pub bind_address: Option<String>,
-    /// Cluster seed nodes for discovery
     pub seed_nodes: Vec<String>,
-    /// Number of threads in the actor execution thread pool
     pub thread_pool_size: usize,
 }
 
@@ -142,12 +305,15 @@ impl Default for ActorSystemConfig {
     }
 }
 
+// ------------------------------------------------------------------
+// ActorContext<M> impl
+// ------------------------------------------------------------------
+
 impl<M: Message> ActorContext<M> {
-    /// Create a new actor context for regular (tell) messages
     pub fn new(
         actor_ref: ActorRef<M>,
-        system: Arc<ActorSystem<M>>,
-        parent: Option<ActorRef<M>>,
+        system: Arc<ActorSystem>,
+        parent: Option<ActorAddress>,
         props: ActorProps,
         stop_requested: Arc<AtomicBool>,
     ) -> Self {
@@ -162,27 +328,7 @@ impl<M: Message> ActorContext<M> {
         }
     }
 
-    /// Create a new actor context with response capability for ask messages
-    pub(crate) fn with_response_capability(
-        actor_ref: ActorRef<M>,
-        system: Arc<ActorSystem<M>>,
-        parent: Option<ActorRef<M>>,
-        props: ActorProps,
-        response_capability: ResponseCapability,
-        stop_requested: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            actor_ref,
-            system,
-            children: Arc::new(RwLock::new(HashMap::new())),
-            parent,
-            props,
-            response_capability: Some(Arc::new(response_capability)),
-            stop_requested,
-        }
-    }
-
-    /// Send a response back (only works during ask handling)
+    /// Send a response back (only works during ask handling).
     pub async fn respond<R: Message + 'static>(&self, response: R) -> Result<(), ActorError> {
         if let Some(capability) = &self.response_capability {
             capability.as_ref().send_response(response).await
@@ -193,12 +339,12 @@ impl<M: Message> ActorContext<M> {
         }
     }
 
-    /// Check if this is an ask request that expects a response
+    /// Returns true if this context is wrapping an ask request.
     pub fn is_ask_request(&self) -> bool {
         self.response_capability.is_some()
     }
 
-    /// Get the correlation ID for the current ask request (if any)
+    /// Get the correlation ID for the current ask request (if any).
     pub fn correlation_id(&self) -> Option<Uuid> {
         self.response_capability
             .as_ref()
@@ -206,7 +352,6 @@ impl<M: Message> ActorContext<M> {
     }
 
     /// Signal the worker loop to stop this actor after the current message returns.
-    /// Only valid inside handle() — has no effect if called from other contexts.
     pub fn stop_self(&self) {
         self.stop_requested.store(true, Ordering::Release);
     }
@@ -217,20 +362,6 @@ impl<M: Message> ActorContext<M> {
     /// Tokio thread pool and the resolved `Ok(msg)` is sent as a normal tell.
     /// `Err(e)` is logged and dropped — encode errors as message variants if
     /// the actor needs to react to them.
-    ///
-    /// ```ignore
-    /// fn handle(&mut self, msg: CrawlerMsg, ctx: &ActorContext<CrawlerMsg>) {
-    ///     match msg {
-    ///         CrawlerMsg::Fetch(url) => {
-    ///             ctx.pipe_to_self(async move {
-    ///                 let html = reqwest::get(&url).await?.text().await?;
-    ///                 Ok(CrawlerMsg::FetchResult(html))
-    ///             });
-    ///         }
-    ///         CrawlerMsg::FetchResult(html) => { /* parse */ }
-    ///     }
-    /// }
-    /// ```
     pub fn pipe_to_self<F, E>(&self, future: F)
     where
         F: std::future::Future<Output = Result<M, E>> + Send + 'static,
@@ -251,117 +382,87 @@ impl<M: Message> ActorContext<M> {
         });
     }
 
-    /// Get reference to this actor
     pub fn actor_ref(&self) -> &ActorRef<M> {
         &self.actor_ref
     }
 
-    /// Get reference to the actor system
-    pub fn system(&self) -> &ActorSystem<M> {
+    pub fn system(&self) -> &ActorSystem {
         &self.system
     }
 
-    /// Spawn a child actor
-    pub async fn spawn_child<A>(
+    /// Spawn a child actor. The child can have any `Actor` type and message type.
+    pub async fn spawn_child<A: Actor>(
         &self,
         name: &str,
         actor: A,
         props: Option<ActorProps>,
-    ) -> Result<ActorRef<M>, ActorError>
-    where
-        A: Actor<M> + 'static,
-    {
+    ) -> Result<ActorRef<A::Msg>, ActorError> {
         let props = props.unwrap_or_default();
 
-        // Create child address
         let child_address = self
             .actor_ref
             .address()
             .child(name)
             .map_err(|e| ActorError::ActorCreationFailed(e.to_string()))?;
 
-        // Create the child actor reference
+        let parent_addr = Some(self.actor_ref.address().clone());
+
         let child_ref = self
             .system
-            .spawn_actor_with_address(child_address, actor, props, Some(self.actor_ref.clone()))
+            .spawn_actor_with_address(child_address, actor, props, parent_addr)
             .await?;
 
-        // Register child
         {
             let mut children = self.children.write().await;
-            children.insert(name.to_string(), child_ref.clone());
+            children.insert(name.to_string(), Box::new(child_ref.clone()));
         }
 
         info!("Spawned child actor: {}", child_ref.address());
         Ok(child_ref)
     }
 
-    /// Get a child actor by name
-    pub async fn get_child(&self, name: &str) -> Option<ActorRef<M>> {
-        let children = self.children.read().await;
-        children.get(name).cloned()
-    }
-
-    /// Get all child actors
-    pub async fn get_children(&self) -> Vec<ActorRef<M>> {
-        let children = self.children.read().await;
-        children.values().cloned().collect()
-    }
-
-    /// Stop a child actor
+    /// Stop a named child actor.
     pub async fn stop_child(&self, name: &str) -> Result<(), ActorError> {
         let child = {
             let mut children = self.children.write().await;
             children.remove(name)
         };
-
         if let Some(child_ref) = child {
-            child_ref.stop().await?;
+            child_ref.stop_now()?;
             debug!("Stopped child actor: {}", name);
         }
-
         Ok(())
     }
 
-    /// Stop all child actors
+    /// Stop all child actors.
     pub async fn stop_all_children(&self) -> Result<(), ActorError> {
         let children = {
-            let mut children_guard = self.children.write().await;
-            let children = children_guard.clone();
-            children_guard.clear();
-            children
+            let mut guard = self.children.write().await;
+            std::mem::take(&mut *guard)
         };
-
-        for (name, child_ref) in children {
-            if let Err(e) = child_ref.stop().await {
+        for (name, child) in children {
+            if let Err(e) = child.stop_now() {
                 error!("Failed to stop child actor {}: {}", name, e);
             }
         }
-
         Ok(())
     }
 
-    /// Get the parent actor reference
-    pub fn parent(&self) -> Option<&ActorRef<M>> {
+    /// Get the parent actor's address (if this is a child actor).
+    pub fn parent(&self) -> Option<&ActorAddress> {
         self.parent.as_ref()
     }
 
-    /// Send a message to another actor
+    /// Send a message to another actor with the same message type.
     pub fn send_to(&self, target: &ActorRef<M>, message: M) -> Result<(), ActorError> {
         target.tell(message, Some(self.actor_ref.clone()))
     }
 
-    /// Look up an actor by address
-    pub async fn select(&self, address: &ActorAddress) -> Option<ActorRef<M>> {
-        self.system.get_actor(address).await
-    }
-
-    /// Get actor properties
     pub fn props(&self) -> &ActorProps {
         &self.props
     }
 
-    /// Schedule a message to be sent after a delay
+    /// Schedule a one-shot message delivery after `delay`.
     pub async fn schedule_once(
         &self,
         delay: std::time::Duration,
@@ -381,183 +482,23 @@ impl<M: Message> ActorContext<M> {
 
         Ok(task_id)
     }
-
-    /// Watch another actor for termination
-    pub async fn watch(&self, target: &ActorRef<M>) -> Result<(), ActorError> {
-        // TODO: Implement actor death watch
-        // This will be implemented with proper supervision in Phase 3
-        debug!("Watching actor: {}", target.address());
-        Ok(())
-    }
-
-    /// Stop watching an actor
-    pub async fn unwatch(&self, target: &ActorRef<M>) -> Result<(), ActorError> {
-        // TODO: Implement actor death watch removal
-        debug!("Unwatching actor: {}", target.address());
-        Ok(())
-    }
 }
 
-impl WorkerPool {
-    fn new<M: Message>(
-        worker_count: usize,
-        actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
-        actors: Arc<DashMap<ActorAddress, ActorRef<M>>>,
-        work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
-    ) -> Self {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mut workers = Vec::new();
+// ------------------------------------------------------------------
+// ActorSystem impl
+// ------------------------------------------------------------------
 
-        for worker_id in 0..worker_count {
-            let storage = actor_storage.clone();
-            let actors = actors.clone();
-            let queue = work_queue.clone();
-            let shutdown_signal = shutdown.clone();
-
-            let worker = tokio::spawn(async move {
-                Self::worker_loop(worker_id, storage, actors, queue, shutdown_signal).await;
-            });
-
-            workers.push(worker);
-        }
-
-        Self { shutdown }
-    }
-
-    async fn worker_loop<M: Message>(
-        worker_id: usize,
-        actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
-        actors: Arc<DashMap<ActorAddress, ActorRef<M>>>,
-        work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
-        shutdown: Arc<AtomicBool>,
-    ) {
-        info!("Worker {} started", worker_id);
-        // TODO aktor-0sm: move to ActorSystemConfig::throughput
-        const BATCH_SIZE: usize = 10;
-
-        while !shutdown.load(Ordering::Relaxed) {
-            match work_queue.steal() {
-                crossbeam::deque::Steal::Success(address) => {
-                    if let Some(mut actor_entry) = actor_storage.get_mut(&address) {
-                        let context = actor_entry.context.clone();
-
-                        // Dispatch one user message, building an ask context when needed.
-                        let dispatch =
-                            |actor_entry: &mut ActorData<M>,
-                             msg: crate::reference::ActorMessage<M>| {
-                                match msg {
-                                    crate::reference::ActorMessage::Tell { message, sender: _ } => {
-                                        actor_entry.actor.handle(message, &context);
-                                    }
-                                    crate::reference::ActorMessage::Ask {
-                                        request,
-                                        message_id: _,
-                                        timestamp: _,
-                                    } => {
-                                        let ask_ctx = ActorContext::with_response_capability(
-                                            context.actor_ref.clone(),
-                                            context.system.clone(),
-                                            context.parent.clone(),
-                                            context.props.clone(),
-                                            ResponseCapability::new(
-                                                request.correlation_id,
-                                                request.response_to.sender,
-                                            ),
-                                            context.stop_requested.clone(),
-                                        );
-                                        actor_entry.actor.handle(request.message, &ask_ctx);
-                                    }
-                                }
-                            };
-
-                        // Check system channel first — PoisonPill takes priority over
-                        // user messages. TODO aktor-aqz: becomes a drain loop that
-                        // continues on Watch/Unwatch and breaks on PoisonPill.
-                        let mut should_stop = matches!(
-                            actor_entry.system_receiver.try_recv(),
-                            Ok(SystemMessage::PoisonPill)
-                        );
-
-                        if !should_stop {
-                            let mut processed = 0;
-                            while processed < BATCH_SIZE {
-                                match actor_entry.receiver.try_recv() {
-                                    Ok(msg) => {
-                                        dispatch(&mut actor_entry, msg);
-                                        processed += 1;
-                                        if actor_entry.stop_requested.load(Ordering::Acquire) {
-                                            should_stop = true;
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-
-                            // Decide whether to reschedule. Clear scheduled=false
-                            // BEFORE the final try_recv so concurrent tell()s that
-                            // arrive in the window see false and push to the queue
-                            // themselves — closing the stuck-message race.
-                            if !should_stop {
-                                actor_entry.scheduled.store(false, Ordering::Release);
-                                // A message arrived in the window — reclaim
-                                // the scheduled slot and continue.
-                                if let Ok(msg) = actor_entry.receiver.try_recv() {
-                                    actor_entry.scheduled.store(true, Ordering::Release);
-                                    dispatch(&mut actor_entry, msg);
-                                    if actor_entry.stop_requested.load(Ordering::Acquire) {
-                                        should_stop = true;
-                                    } else {
-                                        work_queue.push(address.clone());
-                                    }
-                                }
-                                // Err: truly empty — scheduled stays false
-                            }
-                        }
-
-                        if should_stop {
-                            if let Err(e) = actor_entry.actor.post_stop(&context) {
-                                error!("Actor post_stop failed for {}: {}", address, e);
-                            }
-                            // Drop RefMut before removing to avoid DashMap deadlock.
-                            drop(actor_entry);
-                            actor_storage.remove(&address);
-                            actors.remove(&address);
-                            info!("Actor stopped: {}", address);
-                        }
-                    }
-                }
-                crossbeam::deque::Steal::Empty => {
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
-                }
-                crossbeam::deque::Steal::Retry => {
-                    continue;
-                }
-            }
-        }
-
-        info!("Worker {} stopped", worker_id);
-    }
-
-    /// Shutdown the worker pool
-    fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
-}
-
-impl<M: Message> ActorSystem<M> {
-    /// Create a new actor system
+impl ActorSystem {
     pub async fn new(config: ActorSystemConfig) -> Result<Arc<Self>, ActorError> {
         let node_id =
             std::env::var("NODE_ID").unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
 
-        let actor_storage = Arc::new(DashMap::new());
+        let actor_storage: Arc<DashMap<ActorAddress, Box<dyn ActorRunner>>> =
+            Arc::new(DashMap::new());
         let work_queue = Arc::new(crossbeam::deque::Injector::new());
 
         let system = Arc::new(Self {
             config: config.clone(),
-            actors: Arc::new(DashMap::new()),
             node_id,
             worker_pool: Arc::new(RwLock::new(None)),
             actor_storage: actor_storage.clone(),
@@ -565,14 +506,8 @@ impl<M: Message> ActorSystem<M> {
             extensions: Arc::new(ExtensionRegistry::new()),
         });
 
-        // Automatically start worker pool
         let worker_count = config.thread_pool_size;
-        let worker_pool = WorkerPool::new(
-            worker_count,
-            actor_storage,
-            system.actors.clone(),
-            work_queue,
-        );
+        let worker_pool = WorkerPool::new(worker_count, actor_storage, work_queue);
         *system.worker_pool.write().await = Some(worker_pool);
 
         info!(
@@ -582,26 +517,21 @@ impl<M: Message> ActorSystem<M> {
         Ok(system)
     }
 
-    /// Get the node ID
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
 
-    /// Get system configuration
     pub fn config(&self) -> &ActorSystemConfig {
         &self.config
     }
 
-    /// Spawn an actor with automatic address generation
-    pub async fn spawn_actor<A>(
+    /// Spawn an actor with an auto-generated address.
+    pub async fn spawn_actor<A: Actor>(
         self: &Arc<Self>,
         name: &str,
         actor: A,
         props: ActorProps,
-    ) -> Result<ActorRef<M>, ActorError>
-    where
-        A: Actor<M> + 'static,
-    {
+    ) -> Result<ActorRef<A::Msg>, ActorError> {
         let path = crate::system::ActorPath::user(name)
             .map_err(|e| ActorError::ActorCreationFailed(e.to_string()))?;
         let address = ActorAddress::new(&self.node_id, path)
@@ -611,44 +541,32 @@ impl<M: Message> ActorSystem<M> {
             .await
     }
 
-    /// Spawn an actor with a specific address (unified worker pool architecture)
-    pub async fn spawn_actor_with_address<A>(
+    /// Spawn an actor at a specific address with an optional parent address.
+    pub async fn spawn_actor_with_address<A: Actor>(
         self: &Arc<Self>,
         address: ActorAddress,
         mut actor: A,
         props: ActorProps,
-        parent: Option<ActorRef<M>>,
-    ) -> Result<ActorRef<M>, ActorError>
-    where
-        A: Actor<M> + 'static,
-    {
-        // Check if actor already exists
-        if self.actors.contains_key(&address) {
+        parent: Option<ActorAddress>,
+    ) -> Result<ActorRef<A::Msg>, ActorError> {
+        if self.actor_storage.contains_key(&address) {
             return Err(ActorError::ActorCreationFailed(format!(
                 "Actor already exists at address: {}",
                 address
             )));
         }
 
-        // Create user and system message channels for this actor
         let (sender, receiver) = mpsc::unbounded_channel();
         let (system_sender, system_receiver) = mpsc::unbounded_channel::<SystemMessage>();
 
-        // Create actor reference
         let mut actor_ref = ActorRef::new_local(address.clone(), sender);
 
-        // Create scheduled flag for reactive scheduling
         let scheduled = Arc::new(AtomicBool::new(false));
-
-        // Set up reactive scheduling and system channel on the actor reference
         actor_ref.set_scheduling(self.work_queue.clone(), scheduled.clone());
         actor_ref.set_system_sender(system_sender);
 
-        // Stop flag shared between ActorContext (written by stop_self) and
-        // ActorData (read by the worker loop after each handle() call)
         let stop_requested = Arc::new(AtomicBool::new(false));
 
-        // Create actor context
         let context = Arc::new(ActorContext::new(
             actor_ref.clone(),
             self.clone(),
@@ -657,7 +575,6 @@ impl<M: Message> ActorSystem<M> {
             stop_requested.clone(),
         ));
 
-        // Call pre_start
         if let Err(e) = actor.pre_start(&context).await {
             return Err(ActorError::ActorCreationFailed(format!(
                 "Actor pre_start failed: {}",
@@ -665,166 +582,112 @@ impl<M: Message> ActorSystem<M> {
             )));
         }
 
-        // Add actor to the worker pool storage
-        let actor_data = ActorData {
-            actor: Box::new(actor),
+        let runner = Box::new(ActorRunnerImpl {
+            actor,
             context,
             receiver,
             system_receiver,
             scheduled,
             stop_requested,
-        };
+            address: address.clone(),
+            work_queue: self.work_queue.clone(),
+        }) as Box<dyn ActorRunner>;
 
-        // Insert into DashMap (no need for write lock)
-        self.actor_storage.insert(address.clone(), actor_data);
-
-        // Register actor
-        self.actors.insert(address.clone(), actor_ref.clone());
+        self.actor_storage.insert(address.clone(), runner);
 
         info!("Spawned actor: {}", address);
         Ok(actor_ref)
     }
 
-    /// Create an actor using the default factory (for actors with Default trait)
-    pub async fn actor_of<A>(self: &Arc<Self>, name: &str) -> Result<ActorRef<M>, ActorError>
-    where
-        A: Actor<M> + Default + 'static,
-    {
-        let actor = A::default();
-        let props = ActorProps::default();
-        self.spawn_actor(name, actor, props).await
+    /// Spawn a `Default` actor by type.
+    pub async fn actor_of<A: Actor + Default>(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<ActorRef<A::Msg>, ActorError> {
+        self.spawn_actor(name, A::default(), ActorProps::default())
+            .await
     }
 
-    /// Create an actor with arguments using ActorFactoryArgs trait
+    /// Spawn an actor using the `ActorFactoryArgs` trait.
     pub async fn actor_of_args<A, Args>(
         self: &Arc<Self>,
         name: &str,
         args: Args,
-    ) -> Result<ActorRef<M>, ActorError>
+    ) -> Result<ActorRef<A::Msg>, ActorError>
     where
-        A: ActorFactoryArgs<M, Args> + 'static,
+        A: ActorFactoryArgs<Args> + 'static,
         Args: Send + 'static,
     {
         let actor = A::create_args(args);
-        let props = ActorProps::default();
-        self.spawn_actor(name, actor, props).await
+        self.spawn_actor(name, actor, ActorProps::default()).await
     }
 
-    /// Create an actor with custom props
-    pub async fn actor_of_props<A>(
+    /// Spawn a `Default` actor with custom props.
+    pub async fn actor_of_props<A: Actor + Default>(
         self: &Arc<Self>,
         name: &str,
         props: ActorProps,
-    ) -> Result<ActorRef<M>, ActorError>
-    where
-        A: Actor<M> + Default + 'static,
-    {
-        let actor = A::default();
-        self.spawn_actor(name, actor, props).await
+    ) -> Result<ActorRef<A::Msg>, ActorError> {
+        self.spawn_actor(name, A::default(), props).await
     }
 
-    /// Create an actor with arguments and custom props
+    /// Spawn an actor with args and custom props.
     pub async fn actor_of_args_props<A, Args>(
         self: &Arc<Self>,
         name: &str,
         args: Args,
         props: ActorProps,
-    ) -> Result<ActorRef<M>, ActorError>
+    ) -> Result<ActorRef<A::Msg>, ActorError>
     where
-        A: ActorFactoryArgs<M, Args> + 'static,
+        A: ActorFactoryArgs<Args> + 'static,
         Args: Send + 'static,
     {
         let actor = A::create_args(args);
         self.spawn_actor(name, actor, props).await
     }
 
-    /// Get an actor by address
-    pub async fn get_actor(&self, address: &ActorAddress) -> Option<ActorRef<M>> {
-        self.actors.get(address).map(|entry| entry.value().clone())
+    /// Returns true if an actor at `address` is currently alive in the system.
+    pub fn contains_actor(&self, address: &ActorAddress) -> bool {
+        self.actor_storage.contains_key(address)
     }
 
-    /// Get all actors in the system
-    pub async fn get_all_actors(&self) -> Vec<ActorRef<M>> {
-        self.actors
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect()
-    }
-
-    /// Shutdown the actor system gracefully
+    /// Shut down the actor system gracefully.
     pub async fn shutdown(self: Arc<Self>) -> Result<(), ActorError> {
         info!("Shutting down actor system");
 
-        // Shutdown worker pool
         if let Some(pool) = self.worker_pool.read().await.as_ref() {
             pool.shutdown();
         }
 
-        // Call post_stop on all actors
         for mut entry in self.actor_storage.iter_mut() {
-            let (address, actor_data) = entry.pair_mut();
-            if let Err(e) = actor_data.actor.post_stop(&actor_data.context) {
-                error!("Actor post_stop failed for {}: {}", address, e);
-            }
+            entry.value_mut().do_post_stop();
         }
         self.actor_storage.clear();
-
-        // Clear actor registry
-        self.actors.clear();
 
         info!("Actor system shutdown complete");
         Ok(())
     }
 
-    /// Register an extension with the actor system
-    ///
-    /// Extensions are shared resources (HTTP clients, DB pools, etc.) that actors can access.
+    /// Register a shared extension (HTTP client, DB pool, etc.).
     ///
     /// # Panics
     /// Panics if an extension of this type is already registered.
-    ///
-    /// # Example
-    /// ```ignore
-    /// system.register_extension(HttpClientExtension::new());
-    /// ```
     pub fn register_extension<T: Extension>(&self, extension: T) {
         self.extensions.register(extension);
     }
 
-    /// Get an extension by type
+    /// Get a registered extension by type.
     ///
     /// # Panics
     /// Panics if the extension is not registered.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let http = system.extension::<HttpClientExtension>();
-    /// ```
     pub fn extension<T: Extension>(&self) -> Arc<T> {
         self.extensions.get::<T>()
     }
 
-    /// Get an extension by type, returning None if not registered
-    ///
-    /// # Example
-    /// ```ignore
-    /// if let Some(http) = system.extension_optional::<HttpClientExtension>() {
-    ///     // Use http client
-    /// }
-    /// ```
     pub fn extension_optional<T: Extension>(&self) -> Option<Arc<T>> {
         self.extensions.get_optional::<T>()
     }
 
-    /// Get or create an extension
-    ///
-    /// If the extension is already registered, returns it.
-    /// Otherwise, creates a new instance and registers it.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let http = system.get_or_create_extension::<HttpClientExtension>();
-    /// ```
     pub fn get_or_create_extension<T: Extension>(&self) -> Arc<T> {
         self.extensions.get_or_create::<T>()
     }
@@ -863,7 +726,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl Actor<TestMessage> for TestActor {
+    impl Actor for TestActor {
+        type Msg = TestMessage;
+
         fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_count += 1;
             self.received_messages.push(msg.data);
@@ -873,14 +738,14 @@ mod tests {
     #[tokio::test]
     async fn test_actor_system_creation() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
         assert!(!system.node_id().is_empty());
     }
 
     #[tokio::test]
     async fn test_actor_spawning() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
         let actor = TestActor::default();
         let props = ActorProps::default();
@@ -896,7 +761,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_sending() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
         let actor = TestActor::default();
         let props = ActorProps::default();
@@ -910,14 +775,12 @@ mod tests {
             data: "Hello".to_string(),
         };
 
-        // Give the actor a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         let result = actor_ref.tell(message, None);
         assert!(result.is_ok());
     }
 
-    // Test actor with arguments for factory testing
     #[derive(Debug)]
     struct ParameterizedActor {
         name: String,
@@ -925,7 +788,7 @@ mod tests {
         messages: Vec<String>,
     }
 
-    impl ActorFactoryArgs<TestMessage, (String, i32)> for ParameterizedActor {
+    impl ActorFactoryArgs<(String, i32)> for ParameterizedActor {
         fn create_args(args: (String, i32)) -> Self {
             Self {
                 name: args.0,
@@ -936,7 +799,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl Actor<TestMessage> for ParameterizedActor {
+    impl Actor for ParameterizedActor {
+        type Msg = TestMessage;
+
         fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.messages.push(format!("{}: {}", self.name, msg.data));
         }
@@ -945,15 +810,13 @@ mod tests {
     #[tokio::test]
     async fn test_actor_of() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
-        // Test actor_of with Default actors
         let actor_ref = system.actor_of::<TestActor>("test-actor").await.unwrap();
 
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("test-actor"));
 
-        // Test that we can send messages
         let message = TestMessage {
             data: "factory test".to_string(),
         };
@@ -966,9 +829,8 @@ mod tests {
     #[tokio::test]
     async fn test_actor_of_args() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
-        // Test actor_of_args with parameterized actors
         let args = ("worker".to_string(), 42);
         let actor_ref = system
             .actor_of_args::<ParameterizedActor, _>("param-actor", args)
@@ -978,7 +840,6 @@ mod tests {
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("param-actor"));
 
-        // Test message sending
         let message = TestMessage {
             data: "parameterized test".to_string(),
         };
@@ -990,12 +851,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_actor_factory_traits() {
-        // Test DefaultActorFactory
         let factory = crate::DefaultActorFactory::<TestActor>::default();
-        let actor = factory.create_actor::<TestMessage>();
+        let actor = factory.create_actor();
         assert_eq!(actor.received_count, 0);
 
-        // Test ActorFactoryArgs
         let actor = ParameterizedActor::create_args(("test".to_string(), 100));
         assert_eq!(actor.name, "test");
         assert_eq!(actor.initial_value, 100);
@@ -1006,7 +865,6 @@ mod tests {
     async fn test_props_builder() {
         use crate::SupervisionStrategy;
 
-        // Test Props builder pattern
         let props = ActorProps::new()
             .with_mailbox_size(2000)
             .with_dispatcher("test-dispatcher")
@@ -1024,9 +882,8 @@ mod tests {
     #[tokio::test]
     async fn test_actor_of_props() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
-        // Create actor with custom props
         let props = ActorProps::new()
             .with_mailbox_size(5000)
             .with_dispatcher("custom-dispatcher");
@@ -1037,9 +894,7 @@ mod tests {
             .unwrap();
 
         assert!(actor_ref.is_local());
-        assert_eq!(actor_ref.address().name(), Some("props-actor"));
 
-        // Test message sending
         let message = TestMessage {
             data: "props test".to_string(),
         };
@@ -1052,9 +907,8 @@ mod tests {
     #[tokio::test]
     async fn test_actor_of_args_props() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
-        // Create actor with arguments and custom props
         let args = ("custom-worker".to_string(), 999);
         let props = ActorProps::new()
             .with_mailbox_size(3000)
@@ -1066,9 +920,7 @@ mod tests {
             .unwrap();
 
         assert!(actor_ref.is_local());
-        assert_eq!(actor_ref.address().name(), Some("args-props-actor"));
 
-        // Test message sending
         let message = TestMessage {
             data: "args props test".to_string(),
         };
@@ -1081,22 +933,17 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_actors_different_factories() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
-        // Create multiple actors using different factory methods
         let default_actor = system.actor_of::<TestActor>("default").await.unwrap();
         let param_actor = system
             .actor_of_args::<ParameterizedActor, _>("parameterized", ("worker-1".to_string(), 10))
             .await
             .unwrap();
 
-        // Verify they're both working
         assert!(default_actor.is_local());
         assert!(param_actor.is_local());
-        assert_eq!(default_actor.address().name(), Some("default"));
-        assert_eq!(param_actor.address().name(), Some("parameterized"));
 
-        // Send messages to both
         let msg1 = TestMessage {
             data: "msg1".to_string(),
         };
@@ -1113,13 +960,11 @@ mod tests {
     #[tokio::test]
     async fn test_actor_name_uniqueness() {
         let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
-        // Create first actor
         let actor1 = system.actor_of::<TestActor>("unique-name").await.unwrap();
         assert!(actor1.is_local());
 
-        // Try to create second actor with same name - should fail
         let result = system.actor_of::<TestActor>("unique-name").await;
         assert!(result.is_err());
 
@@ -1137,18 +982,20 @@ mod tests {
     }
 
     #[async_trait]
-    impl Actor<TestMessage> for ParentProbeActor {
+    impl Actor for ParentProbeActor {
+        type Msg = TestMessage;
+
         fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
 
         async fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
-            *self.captured.lock().unwrap() = ctx.parent().map(|p| p.address().to_string());
+            *self.captured.lock().unwrap() = ctx.parent().map(|a| a.to_string());
             Ok(())
         }
     }
 
     #[tokio::test]
     async fn test_root_actor_has_no_parent() {
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
@@ -1169,7 +1016,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_child_actor_receives_parent_ref() {
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
@@ -1187,25 +1034,25 @@ mod tests {
                     captured: captured.clone(),
                 },
                 ActorProps::default(),
-                Some(parent_ref.clone()),
+                Some(parent_ref.address().clone()),
             )
             .await
             .unwrap();
 
-        // pre_start is awaited inside spawn_actor_with_address, so
-        // the captured value is set before the call returns.
+        // pre_start is awaited inside spawn_actor_with_address
         assert_eq!(
             *captured.lock().unwrap(),
             Some(parent_ref.address().to_string())
         );
     }
 
-    // Actor that calls ctx.stop_self() on the first message it handles.
     #[derive(Debug, Default)]
     struct SelfStoppingActor;
 
     #[async_trait]
-    impl Actor<TestMessage> for SelfStoppingActor {
+    impl Actor for SelfStoppingActor {
+        type Msg = TestMessage;
+
         fn handle(&mut self, _msg: TestMessage, ctx: &ActorContext<TestMessage>) {
             ctx.stop_self();
         }
@@ -1213,7 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stop_self_removes_actor_from_system() {
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
@@ -1226,18 +1073,17 @@ mod tests {
             .tell(TestMessage { data: "go".into() }, None)
             .unwrap();
 
-        // Give the worker loop time to process the message and clean up.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         assert!(
-            system.get_actor(actor_ref.address()).await.is_none(),
+            !system.contains_actor(actor_ref.address()),
             "actor should have been removed from the system after stop_self()"
         );
     }
 
     #[tokio::test]
     async fn test_poison_pill_removes_actor_from_system() {
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
@@ -1248,19 +1094,16 @@ mod tests {
 
         actor_ref.stop().await.unwrap();
 
-        // Give the worker loop time to process the PoisonPill and clean up.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         assert!(
-            system.get_actor(actor_ref.address()).await.is_none(),
+            !system.contains_actor(actor_ref.address()),
             "actor should have been removed from the system after PoisonPill"
         );
     }
 
     #[tokio::test]
     async fn test_all_messages_delivered_across_batch_boundary() {
-        // Sends more messages than BATCH_SIZE to exercise the rescheduling tail
-        // and verify no message gets stuck in the scheduled-flag race window.
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
 
         let counter = Arc::new(AtomicUsize::new(0));
@@ -1271,13 +1114,15 @@ mod tests {
         }
 
         #[async_trait]
-        impl Actor<TestMessage> for CountingActor {
+        impl Actor for CountingActor {
+            type Msg = TestMessage;
+
             fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
                 self.counter.fetch_add(1, AOrdering::Relaxed);
             }
         }
 
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
@@ -1292,7 +1137,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Send 25 messages — forces at least two full batches plus a remainder.
         const MSG_COUNT: usize = 25;
         for i in 0..MSG_COUNT {
             actor_ref
@@ -1305,7 +1149,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Allow enough time for all batches to drain.
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         assert_eq!(
@@ -1315,8 +1158,6 @@ mod tests {
         );
     }
 
-    // Actor that performs real async work in pre_start and records the result
-    // so tests can verify it completed before the first message was dispatched.
     #[derive(Debug)]
     struct AsyncPreStartActor {
         initialized: Arc<std::sync::Mutex<bool>>,
@@ -1324,15 +1165,15 @@ mod tests {
     }
 
     #[async_trait]
-    impl Actor<TestMessage> for AsyncPreStartActor {
+    impl Actor for AsyncPreStartActor {
+        type Msg = TestMessage;
+
         fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
 
         async fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
-            // Async work: yield to the runtime to prove we can await.
             tokio::task::yield_now().await;
             *self.initialized.lock().unwrap() = true;
 
-            // Spawn a child in pre_start — the canonical muse use case.
             let child = ctx.spawn_child("child", TestActor::default(), None).await?;
             *self.pre_start_child_address.lock().unwrap() = Some(child.address().to_string());
             Ok(())
@@ -1341,7 +1182,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_pre_start_runs_before_first_message() {
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
@@ -1360,8 +1201,6 @@ mod tests {
             .await
             .unwrap();
 
-        // pre_start is awaited inside spawn_actor_with_address, so both
-        // effects are visible before the call returns.
         assert!(
             *initialized.lock().unwrap(),
             "pre_start async work must complete before spawn returns"
@@ -1372,18 +1211,17 @@ mod tests {
         );
     }
 
-    // Actor that uses pipe_to_self to do async work and deliver the result
-    // back through its own mailbox.
     #[derive(Debug)]
     struct PipeActor {
         phase: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait]
-    impl Actor<TestMessage> for PipeActor {
+    impl Actor for PipeActor {
+        type Msg = TestMessage;
+
         fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
             if msg.data == "start" {
-                // Phase 1: kick off async work and return immediately.
                 self.phase.lock().unwrap().push("handle:start".into());
                 ctx.pipe_to_self(async {
                     tokio::task::yield_now().await;
@@ -1392,7 +1230,6 @@ mod tests {
                     })
                 });
             } else if msg.data == "piped" {
-                // Phase 2: the future's result arrived as a normal message.
                 self.phase.lock().unwrap().push("handle:piped".into());
             }
         }
@@ -1400,7 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipe_to_self_delivers_future_result_as_message() {
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
@@ -1426,7 +1263,6 @@ mod tests {
             )
             .unwrap();
 
-        // Give the future time to resolve and the second handle() to run.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let observed = phase.lock().unwrap().clone();
@@ -1437,10 +1273,9 @@ mod tests {
         );
     }
 
-    // Verify that pipe_to_self Err path logs and does not deliver a message.
     #[tokio::test]
     async fn test_pipe_to_self_err_is_dropped() {
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
@@ -1453,7 +1288,9 @@ mod tests {
         }
 
         #[async_trait]
-        impl Actor<TestMessage> for CountActor {
+        impl Actor for CountActor {
+            type Msg = TestMessage;
+
             fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 if msg.data == "start" {
                     ctx.pipe_to_self(async { Err::<TestMessage, &str>("simulated failure") });
@@ -1493,13 +1330,9 @@ mod tests {
         );
     }
 
-    // Verifies that messages sent after pipe_to_self are processed while the
-    // future is still in-flight. Uses a Notify gate to hold the future open
-    // until we've confirmed the subsequent messages were handled — no timing
-    // assumptions needed.
     #[tokio::test]
     async fn test_pipe_to_self_does_not_block_subsequent_messages() {
-        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
@@ -1513,14 +1346,14 @@ mod tests {
         }
 
         #[async_trait]
-        impl Actor<TestMessage> for InterleavingActor {
+        impl Actor for InterleavingActor {
+            type Msg = TestMessage;
+
             fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 if msg.data == "pipe" {
                     self.log.lock().unwrap().push("pipe".into());
                     let gate = self.gate.clone();
                     ctx.pipe_to_self(async move {
-                        // Hold until the test signals — proves handle returned
-                        // and subsequent messages ran before this resolves.
                         gate.notified().await;
                         Ok::<_, std::convert::Infallible>(TestMessage {
                             data: "piped".into(),
@@ -1577,8 +1410,6 @@ mod tests {
             )
             .unwrap();
 
-        // Wait for the worker to drain the mailbox. The future is blocked on
-        // gate.notified(), so "piped" cannot have arrived yet.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         {
@@ -1598,7 +1429,6 @@ mod tests {
             );
         }
 
-        // Release the future — "piped" should now arrive.
         gate.notify_one();
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
@@ -1607,7 +1437,6 @@ mod tests {
             observed.contains(&"piped".to_string()),
             "piped must arrive after gate opens"
         );
-        // msg-b and msg-c must precede piped in the log.
         let msg_b_pos = observed.iter().position(|s| s == "msg-b").unwrap();
         let msg_c_pos = observed.iter().position(|s| s == "msg-c").unwrap();
         let piped_pos = observed.iter().position(|s| s == "piped").unwrap();
