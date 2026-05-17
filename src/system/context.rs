@@ -225,7 +225,7 @@ impl<M: Message> ActorContext<M> {
         // Create the child actor reference
         let child_ref = self
             .system
-            .spawn_actor_with_address(child_address, actor, props)
+            .spawn_actor_with_address(child_address, actor, props, Some(self.actor_ref.clone()))
             .await?;
 
         // Register child
@@ -543,7 +543,8 @@ impl<M: Message> ActorSystem<M> {
         let address = ActorAddress::new(&self.node_id, path)
             .map_err(|e| ActorError::ActorCreationFailed(e.to_string()))?;
 
-        self.spawn_actor_with_address(address, actor, props).await
+        self.spawn_actor_with_address(address, actor, props, None)
+            .await
     }
 
     /// Spawn an actor with a specific address (unified worker pool architecture)
@@ -552,6 +553,7 @@ impl<M: Message> ActorSystem<M> {
         address: ActorAddress,
         mut actor: A,
         props: ActorProps,
+        parent: Option<ActorRef<M>>,
     ) -> Result<ActorRef<M>, ActorError>
     where
         A: Actor<M> + 'static,
@@ -580,7 +582,7 @@ impl<M: Message> ActorSystem<M> {
         let context = Arc::new(ActorContext::new(
             actor_ref.clone(),
             self.clone(),
-            None, // TODO: Set parent for child actors
+            parent,
             props.clone(),
         ));
 
@@ -1050,5 +1052,74 @@ mod tests {
         } else {
             panic!("Expected ActorCreationFailed error");
         }
+    }
+
+    // Captures ctx.parent() address during pre_start for test assertions.
+    #[derive(Debug)]
+    struct ParentProbeActor {
+        captured: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl Actor<TestMessage> for ParentProbeActor {
+        fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
+
+        fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+            *self.captured.lock().unwrap() = ctx.parent().map(|p| p.address().to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_root_actor_has_no_parent() {
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let captured = Arc::new(std::sync::Mutex::new(None::<String>));
+        system
+            .spawn_actor(
+                "root",
+                ParentProbeActor {
+                    captured: captured.clone(),
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_child_actor_receives_parent_ref() {
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let parent_ref = system
+            .spawn_actor("parent", TestActor::default(), ActorProps::default())
+            .await
+            .unwrap();
+
+        let captured = Arc::new(std::sync::Mutex::new(None::<String>));
+        let child_address = parent_ref.address().child("child").unwrap();
+        system
+            .spawn_actor_with_address(
+                child_address,
+                ParentProbeActor {
+                    captured: captured.clone(),
+                },
+                ActorProps::default(),
+                Some(parent_ref.clone()),
+            )
+            .await
+            .unwrap();
+
+        // pre_start runs synchronously inside spawn_actor_with_address, so
+        // the captured value is set before the call returns.
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some(parent_ref.address().to_string())
+        );
     }
 }
