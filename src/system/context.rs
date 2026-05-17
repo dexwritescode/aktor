@@ -211,6 +211,46 @@ impl<M: Message> ActorContext<M> {
         self.stop_requested.store(true, Ordering::Release);
     }
 
+    /// Spawn a future and deliver its result back to this actor's mailbox.
+    ///
+    /// `handle` stays sync and returns immediately. The future runs on the
+    /// Tokio thread pool and the resolved `Ok(msg)` is sent as a normal tell.
+    /// `Err(e)` is logged and dropped — encode errors as message variants if
+    /// the actor needs to react to them.
+    ///
+    /// ```ignore
+    /// fn handle(&mut self, msg: CrawlerMsg, ctx: &ActorContext<CrawlerMsg>) {
+    ///     match msg {
+    ///         CrawlerMsg::Fetch(url) => {
+    ///             ctx.pipe_to_self(async move {
+    ///                 let html = reqwest::get(&url).await?.text().await?;
+    ///                 Ok(CrawlerMsg::FetchResult(html))
+    ///             });
+    ///         }
+    ///         CrawlerMsg::FetchResult(html) => { /* parse */ }
+    ///     }
+    /// }
+    /// ```
+    pub fn pipe_to_self<F, E>(&self, future: F)
+    where
+        F: std::future::Future<Output = Result<M, E>> + Send + 'static,
+        E: std::fmt::Debug + Send + 'static,
+    {
+        let actor_ref = self.actor_ref.clone();
+        tokio::spawn(async move {
+            match future.await {
+                Ok(msg) => {
+                    if let Err(e) = actor_ref.tell(msg, None) {
+                        tracing::error!("pipe_to_self delivery failed: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("pipe_to_self future failed: {:?}", e);
+                }
+            }
+        });
+    }
+
     /// Get reference to this actor
     pub fn actor_ref(&self) -> &ActorRef<M> {
         &self.actor_ref
@@ -1329,6 +1369,252 @@ mod tests {
         assert!(
             child_addr.lock().unwrap().is_some(),
             "child spawned in async pre_start must be registered before spawn returns"
+        );
+    }
+
+    // Actor that uses pipe_to_self to do async work and deliver the result
+    // back through its own mailbox.
+    #[derive(Debug)]
+    struct PipeActor {
+        phase: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Actor<TestMessage> for PipeActor {
+        fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+            if msg.data == "start" {
+                // Phase 1: kick off async work and return immediately.
+                self.phase.lock().unwrap().push("handle:start".into());
+                ctx.pipe_to_self(async {
+                    tokio::task::yield_now().await;
+                    Ok::<_, std::convert::Infallible>(TestMessage {
+                        data: "piped".into(),
+                    })
+                });
+            } else if msg.data == "piped" {
+                // Phase 2: the future's result arrived as a normal message.
+                self.phase.lock().unwrap().push("handle:piped".into());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipe_to_self_delivers_future_result_as_message() {
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let phase = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let actor_ref = system
+            .spawn_actor(
+                "pipe-actor",
+                PipeActor {
+                    phase: phase.clone(),
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "start".into(),
+                },
+                None,
+            )
+            .unwrap();
+
+        // Give the future time to resolve and the second handle() to run.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let observed = phase.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec!["handle:start", "handle:piped"],
+            "handle must return after pipe_to_self, then piped result must arrive as a message"
+        );
+    }
+
+    // Verify that pipe_to_self Err path logs and does not deliver a message.
+    #[tokio::test]
+    async fn test_pipe_to_self_err_is_dropped() {
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received_clone = received.clone();
+
+        #[derive(Debug)]
+        struct CountActor {
+            count: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Actor<TestMessage> for CountActor {
+            fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+                if msg.data == "start" {
+                    ctx.pipe_to_self(async { Err::<TestMessage, &str>("simulated failure") });
+                } else {
+                    self.count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        let actor_ref = system
+            .spawn_actor(
+                "err-pipe-actor",
+                CountActor {
+                    count: received_clone,
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "start".into(),
+                },
+                None,
+            )
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            received.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "Err from pipe_to_self must not deliver a message"
+        );
+    }
+
+    // Verifies that messages sent after pipe_to_self are processed while the
+    // future is still in-flight. Uses a Notify gate to hold the future open
+    // until we've confirmed the subsequent messages were handled — no timing
+    // assumptions needed.
+    #[tokio::test]
+    async fn test_pipe_to_self_does_not_block_subsequent_messages() {
+        let system: Arc<ActorSystem<TestMessage>> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        #[derive(Debug)]
+        struct InterleavingActor {
+            log: Arc<std::sync::Mutex<Vec<String>>>,
+            gate: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl Actor<TestMessage> for InterleavingActor {
+            fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+                if msg.data == "pipe" {
+                    self.log.lock().unwrap().push("pipe".into());
+                    let gate = self.gate.clone();
+                    ctx.pipe_to_self(async move {
+                        // Hold until the test signals — proves handle returned
+                        // and subsequent messages ran before this resolves.
+                        gate.notified().await;
+                        Ok::<_, std::convert::Infallible>(TestMessage {
+                            data: "piped".into(),
+                        })
+                    });
+                } else {
+                    self.log.lock().unwrap().push(msg.data.clone());
+                }
+            }
+        }
+
+        let actor_ref = system
+            .spawn_actor(
+                "interleave-actor",
+                InterleavingActor {
+                    log: log.clone(),
+                    gate: gate.clone(),
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "msg-a".into(),
+                },
+                None,
+            )
+            .unwrap();
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "pipe".into(),
+                },
+                None,
+            )
+            .unwrap();
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "msg-b".into(),
+                },
+                None,
+            )
+            .unwrap();
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "msg-c".into(),
+                },
+                None,
+            )
+            .unwrap();
+
+        // Wait for the worker to drain the mailbox. The future is blocked on
+        // gate.notified(), so "piped" cannot have arrived yet.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        {
+            let observed = log.lock().unwrap().clone();
+            assert!(
+                observed.contains(&"msg-b".to_string()),
+                "msg-b must be processed while future is in-flight"
+            );
+            assert!(
+                observed.contains(&"msg-c".to_string()),
+                "msg-c must be processed while future is in-flight"
+            );
+            assert!(
+                !observed.contains(&"piped".to_string()),
+                "piped must not arrive before gate is opened, got: {:?}",
+                observed
+            );
+        }
+
+        // Release the future — "piped" should now arrive.
+        gate.notify_one();
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        let observed = log.lock().unwrap().clone();
+        assert!(
+            observed.contains(&"piped".to_string()),
+            "piped must arrive after gate opens"
+        );
+        // msg-b and msg-c must precede piped in the log.
+        let msg_b_pos = observed.iter().position(|s| s == "msg-b").unwrap();
+        let msg_c_pos = observed.iter().position(|s| s == "msg-c").unwrap();
+        let piped_pos = observed.iter().position(|s| s == "piped").unwrap();
+        assert!(
+            piped_pos > msg_b_pos && piped_pos > msg_c_pos,
+            "piped must appear after msg-b and msg-c, got: {:?}",
+            observed
         );
     }
 }
