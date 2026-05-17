@@ -8,16 +8,16 @@
 //! ```
 
 // Core traits and types
-pub use crate::core::{Actor, Message, ActorError, ActorProps};
+pub use crate::core::{Actor, ActorError, ActorProps, Message};
 
 // System types
-pub use crate::system::{ActorSystem, ActorSystemConfig, ActorContext,
-                        ActorAddress, ActorPath};
+pub use crate::system::{ActorAddress, ActorContext, ActorPath, ActorSystem, ActorSystemConfig};
 
 // Reference types
-pub use crate::reference::{ActorRef, LocalActorRef, RemoteActorRef,
-                          ask, ask_with_actor_ref, AskError, AskExt, AskFuture};
+pub use crate::reference::{
+    ActorRef, AskError, AskExt, AskFuture, LocalActorRef, RemoteActorRef, ask, ask_with_actor_ref,
+};
 
 // Testing utilities (when feature is enabled)
 #[cfg(feature = "test-util")]
-pub use crate::testing::{ActorTestKit, TestProbe, TestContext, TestMessage, ExpectationResult};
+pub use crate::testing::{ActorTestKit, ExpectationResult, TestContext, TestMessage, TestProbe};

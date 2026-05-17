@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
+    use crate::reference::ask::{AskRequest, ResponseChannel};
     use crate::{Actor, ActorContext, ActorSystem, ActorSystemConfig, Message};
-    use crate::reference::ask::{ResponseChannel, AskRequest};
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -26,8 +26,6 @@ mod tests {
             "EchoResponse"
         }
     }
-
-
 
     #[derive(Debug)]
     struct EchoActor {
@@ -61,14 +59,14 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn test_ask_basic_functionality() {
         let config = ActorSystemConfig::default();
         let system = ActorSystem::new(config).await.unwrap();
 
         let echo_actor = EchoActor::default();
-        let actor_ref = system.spawn_actor("echo-actor", echo_actor, crate::ActorProps::default())
+        let actor_ref = system
+            .spawn_actor("echo-actor", echo_actor, crate::ActorProps::default())
             .await
             .unwrap();
 
@@ -80,9 +78,8 @@ mod tests {
         };
 
         // Test ask pattern - should now work with context-based responses
-        let result: Result<EchoResponse, crate::AskError> = actor_ref
-            .ask(message, Duration::from_secs(1))
-            .await;
+        let result: Result<EchoResponse, crate::AskError> =
+            actor_ref.ask(message, Duration::from_secs(1)).await;
 
         // Should now succeed with the new implementation
         match result {
@@ -104,7 +101,8 @@ mod tests {
         let system = ActorSystem::new(config).await.unwrap();
 
         let echo_actor = EchoActor::default();
-        let actor_ref = system.spawn_actor("echo-ext-actor", echo_actor, crate::ActorProps::default())
+        let actor_ref = system
+            .spawn_actor("echo-ext-actor", echo_actor, crate::ActorProps::default())
             .await
             .unwrap();
 
@@ -193,7 +191,8 @@ mod tests {
         let system = ActorSystem::new(config).await.unwrap();
 
         let echo_actor = EchoActor::default();
-        let actor_ref = system.spawn_actor("tell-actor", echo_actor, crate::ActorProps::default())
+        let actor_ref = system
+            .spawn_actor("tell-actor", echo_actor, crate::ActorProps::default())
             .await
             .unwrap();
 
@@ -218,7 +217,8 @@ mod tests {
         let system = ActorSystem::new(config).await.unwrap();
 
         let echo_actor = EchoActor::default();
-        let actor_ref = system.spawn_actor("timeout-actor", echo_actor, crate::ActorProps::default())
+        let actor_ref = system
+            .spawn_actor("timeout-actor", echo_actor, crate::ActorProps::default())
             .await
             .unwrap();
 
@@ -231,9 +231,8 @@ mod tests {
 
         // Test timeout behavior with very short timeout
         let start_time = std::time::Instant::now();
-        let result: Result<EchoResponse, crate::AskError> = actor_ref
-            .ask(message, Duration::from_millis(1))
-            .await;
+        let result: Result<EchoResponse, crate::AskError> =
+            actor_ref.ask(message, Duration::from_millis(1)).await;
 
         let elapsed = start_time.elapsed();
 

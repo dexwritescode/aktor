@@ -1,10 +1,10 @@
-use crate::{ActorAddress, ActorError, Message, AskError};
 use crate::ask::AskRequest;
+use crate::{ActorAddress, ActorError, AskError, Message};
 use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 /// Actor reference - a handle to communicate with an actor
@@ -138,10 +138,7 @@ impl<M: Message> ActorRef<M> {
     }
 
     /// Create a new remote actor reference
-    pub fn new_remote(
-        address: ActorAddress,
-        transport: Arc<dyn NetworkTransport<M>>,
-    ) -> Self {
+    pub fn new_remote(address: ActorAddress, transport: Arc<dyn NetworkTransport<M>>) -> Self {
         let target_node = address.node_id.clone();
         Self {
             id: Uuid::new_v4(),
@@ -155,10 +152,7 @@ impl<M: Message> ActorRef<M> {
 
     /// Send a message to the actor (fire-and-forget)
     pub fn tell(&self, message: M, sender: Option<ActorRef<M>>) -> Result<(), ActorError> {
-        let actor_message = ActorMessage::Tell {
-            message,
-            sender,
-        };
+        let actor_message = ActorMessage::Tell { message, sender };
 
         match &self.inner {
             ActorRefInner::Local(local_ref) => local_ref.send(actor_message),
@@ -200,9 +194,7 @@ impl<M: Message> ActorRef<M> {
     /// Get the actor's current state (only for local actors)
     pub async fn state(&self) -> Option<ActorState> {
         match &self.inner {
-            ActorRefInner::Local(local_ref) => {
-                Some(local_ref.state.read().await.clone())
-            }
+            ActorRefInner::Local(local_ref) => Some(local_ref.state.read().await.clone()),
             ActorRefInner::Remote(_) => None,
         }
     }
@@ -270,9 +262,10 @@ impl<M: Message> RemoteActorRef<M> {
         message: ActorMessage<M>,
     ) -> Result<(), ActorError> {
         if !self.transport.is_reachable(&self.target_node) {
-            return Err(ActorError::NetworkError(
-                format!("Node {} is not reachable", self.target_node),
-            ));
+            return Err(ActorError::NetworkError(format!(
+                "Node {} is not reachable",
+                self.target_node
+            )));
         }
 
         self.transport.send(target_address, message)
@@ -323,11 +316,10 @@ impl<M: Message> NetworkTransport<M> for DummyTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ActorPath, ActorAddress};
+    use crate::{ActorAddress, ActorPath};
 
     #[derive(Debug, Clone)]
-    struct TestMessage {
-    }
+    struct TestMessage {}
 
     impl Message for TestMessage {
         fn type_id(&self) -> &'static str {

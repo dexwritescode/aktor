@@ -119,17 +119,26 @@ async fn asynchronous_testing_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ Counter actor spawned successfully");
 
     // Test basic operations
-    counter.tell(TestMessage::new(CounterMessage {
-        operation: CounterOp::Increment
-    }), None)?;
+    counter.tell(
+        TestMessage::new(CounterMessage {
+            operation: CounterOp::Increment,
+        }),
+        None,
+    )?;
 
-    counter.tell(TestMessage::new(CounterMessage {
-        operation: CounterOp::Increment
-    }), None)?;
+    counter.tell(
+        TestMessage::new(CounterMessage {
+            operation: CounterOp::Increment,
+        }),
+        None,
+    )?;
 
-    counter.tell(TestMessage::new(CounterMessage {
-        operation: CounterOp::Decrement
-    }), None)?;
+    counter.tell(
+        TestMessage::new(CounterMessage {
+            operation: CounterOp::Decrement,
+        }),
+        None,
+    )?;
 
     // Wait for message processing
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -145,30 +154,48 @@ async fn ask_pattern_testing_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing ask pattern with ActorTestKit...");
 
     let test_kit = ActorTestKit::new().await;
-    let counter = test_kit.spawn(CounterActor::default(), "ask-counter").await?;
+    let counter = test_kit
+        .spawn(CounterActor::default(), "ask-counter")
+        .await?;
 
     // Increment a few times
-    counter.tell(TestMessage::new(CounterMessage {
-        operation: CounterOp::Increment
-    }), None)?;
-    counter.tell(TestMessage::new(CounterMessage {
-        operation: CounterOp::Increment
-    }), None)?;
-    counter.tell(TestMessage::new(CounterMessage {
-        operation: CounterOp::Increment
-    }), None)?;
+    counter.tell(
+        TestMessage::new(CounterMessage {
+            operation: CounterOp::Increment,
+        }),
+        None,
+    )?;
+    counter.tell(
+        TestMessage::new(CounterMessage {
+            operation: CounterOp::Increment,
+        }),
+        None,
+    )?;
+    counter.tell(
+        TestMessage::new(CounterMessage {
+            operation: CounterOp::Increment,
+        }),
+        None,
+    )?;
 
     // Wait for processing
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Ask for the current count
-    let response: TestMessage = counter.ask(
-        TestMessage::new(CounterMessage { operation: CounterOp::GetCount }),
-        Duration::from_secs(1)
-    ).await?;
+    let response: TestMessage = counter
+        .ask(
+            TestMessage::new(CounterMessage {
+                operation: CounterOp::GetCount,
+            }),
+            Duration::from_secs(1),
+        )
+        .await?;
 
     if let Some(counter_response) = response.extract::<CounterResponse>() {
-        println!("✅ Ask pattern successful! Count: {}", counter_response.count);
+        println!(
+            "✅ Ask pattern successful! Count: {}",
+            counter_response.count
+        );
         assert_eq!(counter_response.count, 3);
     } else {
         println!("❌ Failed to extract CounterResponse from ask response");
@@ -187,10 +214,9 @@ async fn test_probe_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ Test probe created");
 
     // Send a message directly to the probe
-    probe.actor_ref().tell(
-        TestMessage::new(CounterResponse { count: 42 }),
-        None
-    )?;
+    probe
+        .actor_ref()
+        .tell(TestMessage::new(CounterResponse { count: 42 }), None)?;
 
     // Wait for message processing
     tokio::time::sleep(Duration::from_millis(50)).await;

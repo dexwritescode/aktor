@@ -1,5 +1,5 @@
-pub mod message;
 pub mod actor;
+pub mod message;
 
-pub use message::*;
 pub use actor::*;
+pub use message::*;

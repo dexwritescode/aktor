@@ -1,13 +1,16 @@
-use crate::core::{Actor, ActorError, Message, ActorFactoryArgs, ActorProps};
-use crate::system::{ActorAddress, extension::{Extension, ExtensionRegistry}};
+use crate::core::{Actor, ActorError, ActorFactoryArgs, ActorProps, Message};
 use crate::reference::{ActorRef, ResponseEnvelope};
+use crate::system::{
+    ActorAddress,
+    extension::{Extension, ExtensionRegistry},
+};
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use dashmap::DashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info};
 use uuid::Uuid;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Response capability for ask pattern - embedded in context during ask handling
 pub(crate) struct ResponseCapability {
@@ -18,7 +21,10 @@ pub(crate) struct ResponseCapability {
 }
 
 impl ResponseCapability {
-    pub(crate) fn new(correlation_id: Uuid, sender: mpsc::UnboundedSender<ResponseEnvelope>) -> Self {
+    pub(crate) fn new(
+        correlation_id: Uuid,
+        sender: mpsc::UnboundedSender<ResponseEnvelope>,
+    ) -> Self {
         Self {
             correlation_id,
             sender,
@@ -26,16 +32,19 @@ impl ResponseCapability {
     }
 
     /// Send a response back through this capability
-    pub(crate) async fn send_response<R: Message + 'static>(&self, response: R) -> Result<(), ActorError> {
+    pub(crate) async fn send_response<R: Message + 'static>(
+        &self,
+        response: R,
+    ) -> Result<(), ActorError> {
         let envelope = ResponseEnvelope {
             data: Box::new(response),
             type_name: std::any::type_name::<R>(),
             correlation_id: self.correlation_id,
         };
 
-        self.sender
-            .send(envelope)
-            .map_err(|_| ActorError::MessageDeliveryFailed("Response channel closed".to_string()))?;
+        self.sender.send(envelope).map_err(|_| {
+            ActorError::MessageDeliveryFailed("Response channel closed".to_string())
+        })?;
 
         Ok(())
     }
@@ -179,7 +188,9 @@ impl<M: Message> ActorContext<M> {
 
     /// Get the correlation ID for the current ask request (if any)
     pub fn correlation_id(&self) -> Option<Uuid> {
-        self.response_capability.as_ref().map(|cap| cap.correlation_id)
+        self.response_capability
+            .as_ref()
+            .map(|cap| cap.correlation_id)
     }
 
     /// Get reference to this actor
@@ -205,12 +216,17 @@ impl<M: Message> ActorContext<M> {
         let props = props.unwrap_or_default();
 
         // Create child address
-        let child_address = self.actor_ref.address()
+        let child_address = self
+            .actor_ref
+            .address()
             .child(name)
             .map_err(|e| ActorError::ActorCreationFailed(e.to_string()))?;
 
         // Create the child actor reference
-        let child_ref = self.system.spawn_actor_with_address(child_address, actor, props).await?;
+        let child_ref = self
+            .system
+            .spawn_actor_with_address(child_address, actor, props)
+            .await?;
 
         // Register child
         {
@@ -273,11 +289,7 @@ impl<M: Message> ActorContext<M> {
     }
 
     /// Send a message to another actor
-    pub fn send_to(
-        &self,
-        target: &ActorRef<M>,
-        message: M,
-    ) -> Result<(), ActorError> {
+    pub fn send_to(&self, target: &ActorRef<M>, message: M) -> Result<(), ActorError> {
         target.tell(message, Some(self.actor_ref.clone()))
     }
 
@@ -351,9 +363,7 @@ impl WorkerPool {
             workers.push(worker);
         }
 
-        Self {
-            shutdown,
-        }
+        Self { shutdown }
     }
 
     /// Worker loop with work-stealing - only processes actors with pending messages
@@ -361,7 +371,7 @@ impl WorkerPool {
         worker_id: usize,
         actor_storage: Arc<DashMap<ActorAddress, ActorData<M>>>,
         work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
-        shutdown: Arc<AtomicBool>
+        shutdown: Arc<AtomicBool>,
     ) {
         info!("Worker {} started", worker_id);
         const BATCH_SIZE: usize = 10; // Process up to 10 messages per actor before re-scheduling
@@ -382,24 +392,32 @@ impl WorkerPool {
                             match actor_entry.receiver.try_recv() {
                                 Ok(message) => {
                                     match message {
-                                        crate::reference::ActorMessage::Tell { message, sender: _ } => {
+                                        crate::reference::ActorMessage::Tell {
+                                            message,
+                                            sender: _,
+                                        } => {
                                             // Process tell message synchronously
                                             actor_entry.actor.handle(message, &context);
                                         }
-                                        crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
+                                        crate::reference::ActorMessage::Ask {
+                                            request,
+                                            message_id: _,
+                                            timestamp: _,
+                                        } => {
                                             // Create ask context with response capability
                                             let response_capability = ResponseCapability::new(
                                                 request.correlation_id,
                                                 request.response_to.sender,
                                             );
 
-                                            let ask_context = ActorContext::with_response_capability(
-                                                context.actor_ref.clone(),
-                                                context.system.clone(),
-                                                context.parent.clone(),
-                                                context.props.clone(),
-                                                response_capability,
-                                            );
+                                            let ask_context =
+                                                ActorContext::with_response_capability(
+                                                    context.actor_ref.clone(),
+                                                    context.system.clone(),
+                                                    context.parent.clone(),
+                                                    context.props.clone(),
+                                                    response_capability,
+                                                );
 
                                             // Process ask message synchronously
                                             actor_entry.actor.handle(request.message, &ask_context);
@@ -419,7 +437,11 @@ impl WorkerPool {
                                     crate::reference::ActorMessage::Tell { message, sender: _ } => {
                                         actor_entry.actor.handle(message, &context);
                                     }
-                                    crate::reference::ActorMessage::Ask { request, message_id: _, timestamp: _ } => {
+                                    crate::reference::ActorMessage::Ask {
+                                        request,
+                                        message_id: _,
+                                        timestamp: _,
+                                    } => {
                                         let response_capability = ResponseCapability::new(
                                             request.correlation_id,
                                             request.response_to.sender,
@@ -468,8 +490,8 @@ impl WorkerPool {
 impl<M: Message> ActorSystem<M> {
     /// Create a new actor system
     pub async fn new(config: ActorSystemConfig) -> Result<Arc<Self>, ActorError> {
-        let node_id = std::env::var("NODE_ID")
-            .unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
+        let node_id =
+            std::env::var("NODE_ID").unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
 
         let actor_storage = Arc::new(DashMap::new());
         let work_queue = Arc::new(crossbeam::deque::Injector::new());
@@ -489,7 +511,10 @@ impl<M: Message> ActorSystem<M> {
         let worker_pool = WorkerPool::new(worker_count, actor_storage, work_queue);
         *system.worker_pool.write().await = Some(worker_pool);
 
-        info!("Created actor system with node ID: {} and {} workers", system.node_id, worker_count);
+        info!(
+            "Created actor system with node ID: {} and {} workers",
+            system.node_id, worker_count
+        );
         Ok(system)
     }
 
@@ -533,9 +558,10 @@ impl<M: Message> ActorSystem<M> {
     {
         // Check if actor already exists
         if self.actors.contains_key(&address) {
-            return Err(ActorError::ActorCreationFailed(
-                format!("Actor already exists at address: {}", address),
-            ));
+            return Err(ActorError::ActorCreationFailed(format!(
+                "Actor already exists at address: {}",
+                address
+            )));
         }
 
         // Create message channel for this actor
@@ -560,9 +586,10 @@ impl<M: Message> ActorSystem<M> {
 
         // Call pre_start
         if let Err(e) = actor.pre_start(&context) {
-            return Err(ActorError::ActorCreationFailed(
-                format!("Actor pre_start failed: {}", e),
-            ));
+            return Err(ActorError::ActorCreationFailed(format!(
+                "Actor pre_start failed: {}",
+                e
+            )));
         }
 
         // Add actor to the worker pool storage
@@ -584,10 +611,7 @@ impl<M: Message> ActorSystem<M> {
     }
 
     /// Create an actor using the default factory (for actors with Default trait)
-    pub async fn actor_of<A>(
-        self: &Arc<Self>,
-        name: &str,
-    ) -> Result<ActorRef<M>, ActorError>
+    pub async fn actor_of<A>(self: &Arc<Self>, name: &str) -> Result<ActorRef<M>, ActorError>
     where
         A: Actor<M> + Default + 'static,
     {
@@ -646,7 +670,10 @@ impl<M: Message> ActorSystem<M> {
 
     /// Get all actors in the system
     pub async fn get_all_actors(&self) -> Vec<ActorRef<M>> {
-        self.actors.iter().map(|entry| entry.value().clone()).collect()
+        self.actors
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// Shutdown the actor system gracefully
@@ -781,7 +808,10 @@ mod tests {
         let actor = TestActor::default();
         let props = ActorProps::default();
 
-        let actor_ref = system.spawn_actor("test-actor", actor, props).await.unwrap();
+        let actor_ref = system
+            .spawn_actor("test-actor", actor, props)
+            .await
+            .unwrap();
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("test-actor"));
     }
@@ -794,7 +824,10 @@ mod tests {
         let actor = TestActor::default();
         let props = ActorProps::default();
 
-        let actor_ref = system.spawn_actor("test-actor", actor, props).await.unwrap();
+        let actor_ref = system
+            .spawn_actor("test-actor", actor, props)
+            .await
+            .unwrap();
 
         let message = TestMessage {
             data: "Hello".to_string(),
@@ -859,7 +892,10 @@ mod tests {
 
         // Test actor_of_args with parameterized actors
         let args = ("worker".to_string(), 42);
-        let actor_ref = system.actor_of_args::<ParameterizedActor, _>("param-actor", args).await.unwrap();
+        let actor_ref = system
+            .actor_of_args::<ParameterizedActor, _>("param-actor", args)
+            .await
+            .unwrap();
 
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("param-actor"));
@@ -917,7 +953,10 @@ mod tests {
             .with_mailbox_size(5000)
             .with_dispatcher("custom-dispatcher");
 
-        let actor_ref = system.actor_of_props::<TestActor>("props-actor", props).await.unwrap();
+        let actor_ref = system
+            .actor_of_props::<TestActor>("props-actor", props)
+            .await
+            .unwrap();
 
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("props-actor"));
@@ -943,11 +982,10 @@ mod tests {
             .with_mailbox_size(3000)
             .with_supervision(crate::SupervisionStrategy::Restart);
 
-        let actor_ref = system.actor_of_args_props::<ParameterizedActor, _>(
-            "args-props-actor",
-            args,
-            props
-        ).await.unwrap();
+        let actor_ref = system
+            .actor_of_args_props::<ParameterizedActor, _>("args-props-actor", args, props)
+            .await
+            .unwrap();
 
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("args-props-actor"));
@@ -969,10 +1007,10 @@ mod tests {
 
         // Create multiple actors using different factory methods
         let default_actor = system.actor_of::<TestActor>("default").await.unwrap();
-        let param_actor = system.actor_of_args::<ParameterizedActor, _>(
-            "parameterized",
-            ("worker-1".to_string(), 10)
-        ).await.unwrap();
+        let param_actor = system
+            .actor_of_args::<ParameterizedActor, _>("parameterized", ("worker-1".to_string(), 10))
+            .await
+            .unwrap();
 
         // Verify they're both working
         assert!(default_actor.is_local());
@@ -981,8 +1019,12 @@ mod tests {
         assert_eq!(param_actor.address().name(), Some("parameterized"));
 
         // Send messages to both
-        let msg1 = TestMessage { data: "msg1".to_string() };
-        let msg2 = TestMessage { data: "msg2".to_string() };
+        let msg1 = TestMessage {
+            data: "msg1".to_string(),
+        };
+        let msg2 = TestMessage {
+            data: "msg2".to_string(),
+        };
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 

@@ -61,7 +61,9 @@ pub trait Extension: Send + Sync + 'static {
     ///
     /// Called once when the extension is first registered.
     /// Has access to the actor system for initialization if needed.
-    fn new_extension() -> Self where Self: Sized;
+    fn new_extension() -> Self
+    where
+        Self: Sized;
 }
 
 /// Registry of actor system extensions
