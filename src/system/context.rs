@@ -448,8 +448,29 @@ impl<M: Message> ActorContext<M> {
         Ok(())
     }
 
-    /// Get the parent actor's address (if this is a child actor).
-    pub fn parent(&self) -> Option<&ActorAddress> {
+    /// Returns the parent actor's address, if this is a child actor.
+    ///
+    /// This is an address only — it cannot be used to send messages directly.
+    /// Parent and child may have different message types, so there is no
+    /// typed `ActorRef` to call `.tell()` on.
+    ///
+    /// **To send messages to the parent**, store the parent's `ActorRef<ParentMsg>`
+    /// in the child actor's own fields and pass it at construction:
+    ///
+    /// ```ignore
+    /// struct WorkerActor {
+    ///     parent: ActorRef<SupervisorMsg>,
+    /// }
+    /// impl Actor for WorkerActor {
+    ///     type Msg = WorkerMsg;
+    ///     fn handle(&mut self, msg: WorkerMsg, _ctx: &ActorContext<WorkerMsg>) {
+    ///         self.parent.tell(SupervisorMsg::Done, None).unwrap();
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// `parent_address()` is intended for supervision and death-watch only.
+    pub fn parent_address(&self) -> Option<&ActorAddress> {
         self.parent.as_ref()
     }
 
@@ -975,7 +996,7 @@ mod tests {
         }
     }
 
-    // Captures ctx.parent() address during pre_start for test assertions.
+    // Captures ctx.parent_address() during pre_start for test assertions.
     #[derive(Debug)]
     struct ParentProbeActor {
         captured: Arc<std::sync::Mutex<Option<String>>>,
@@ -988,7 +1009,7 @@ mod tests {
         fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
 
         async fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
-            *self.captured.lock().unwrap() = ctx.parent().map(|a| a.to_string());
+            *self.captured.lock().unwrap() = ctx.parent_address().map(|a| a.to_string());
             Ok(())
         }
     }
