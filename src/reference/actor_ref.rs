@@ -261,9 +261,11 @@ impl<M: Message> ActorRef<M> {
                         "Actor system sender not initialised".to_string(),
                     )
                 })?;
-                sender.send(crate::system::SystemMessage::PoisonPill).map_err(|_| {
-                    ActorError::MessageDeliveryFailed("System channel closed".to_string())
-                })?;
+                sender
+                    .send(crate::system::SystemMessage::PoisonPill)
+                    .map_err(|_| {
+                        ActorError::MessageDeliveryFailed("System channel closed".to_string())
+                    })?;
                 if let (Some(wq), Some(scheduled)) = (&local_ref.work_queue, &local_ref.scheduled) {
                     use std::sync::atomic::Ordering;
                     if !scheduled.swap(true, Ordering::AcqRel) {

@@ -234,7 +234,9 @@ impl WorkerPool {
                         let guard = actor_storage.get_mut(&address);
                         if let Some(mut runner) = guard {
                             let stop = matches!(runner.run_batch(BATCH_SIZE), RunResult::Stop);
-                            if stop { runner.do_post_stop(); }
+                            if stop {
+                                runner.do_post_stop();
+                            }
                             stop
                         } else {
                             false
@@ -1376,16 +1378,36 @@ mod tests {
             .unwrap();
 
         actor_ref
-            .tell(TestMessage { data: "msg-a".into() }, None)
+            .tell(
+                TestMessage {
+                    data: "msg-a".into(),
+                },
+                None,
+            )
             .unwrap();
         actor_ref
-            .tell(TestMessage { data: "pipe".into() }, None)
+            .tell(
+                TestMessage {
+                    data: "pipe".into(),
+                },
+                None,
+            )
             .unwrap();
         actor_ref
-            .tell(TestMessage { data: "msg-b".into() }, None)
+            .tell(
+                TestMessage {
+                    data: "msg-b".into(),
+                },
+                None,
+            )
             .unwrap();
         actor_ref
-            .tell(TestMessage { data: "msg-c".into() }, None)
+            .tell(
+                TestMessage {
+                    data: "msg-c".into(),
+                },
+                None,
+            )
             .unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

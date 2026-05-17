@@ -235,7 +235,11 @@ impl ActorTestKit {
     }
 
     /// Spawn an actor in the test environment
-    pub async fn spawn<A: Actor>(&self, actor: A, name: &str) -> Result<ActorRef<A::Msg>, ActorError> {
+    pub async fn spawn<A: Actor>(
+        &self,
+        actor: A,
+        name: &str,
+    ) -> Result<ActorRef<A::Msg>, ActorError> {
         self.system
             .spawn_actor(name, actor, ActorProps::default())
             .await
