@@ -43,7 +43,9 @@ impl BenchActor {
     }
 }
 
-impl Actor<BenchMessage> for BenchActor {
+impl Actor for BenchActor {
+    type Msg = BenchMessage;
+
     fn handle(&mut self, msg: BenchMessage, _ctx: &ActorContext<BenchMessage>) {
         self.message_count += 1;
 
@@ -68,8 +70,8 @@ struct BenchmarkConfig {
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
-            actor_count: 10000,
-            messages_per_actor: 50000,
+            actor_count: 100,
+            messages_per_actor: 10_000,
         }
     }
 }
@@ -133,8 +135,7 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
         actor_refs.push(actor_ref);
     }
 
-    println!("Actors created. Setting up interconnections...");
-    sleep(Duration::from_millis(10000)).await;
+    println!("Actors created.");
 
     // Note: In our current design, we can't easily inject references to other actors
     // after creation, so actors will discover each other through the system registry

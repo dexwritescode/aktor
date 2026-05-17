@@ -250,6 +250,33 @@ impl<M: Message> ActorRef<M> {
     pub fn id(&self) -> Uuid {
         self.id
     }
+
+    /// Synchronous stop — sends a PoisonPill without blocking.
+    /// Used by the type-erased children map in ActorContext.
+    pub fn stop_sync(&self) -> Result<(), ActorError> {
+        match &self.inner {
+            ActorRefInner::Local(local_ref) => {
+                let sender = local_ref.system_sender.as_ref().ok_or_else(|| {
+                    ActorError::MessageDeliveryFailed(
+                        "Actor system sender not initialised".to_string(),
+                    )
+                })?;
+                sender.send(crate::system::SystemMessage::PoisonPill).map_err(|_| {
+                    ActorError::MessageDeliveryFailed("System channel closed".to_string())
+                })?;
+                if let (Some(wq), Some(scheduled)) = (&local_ref.work_queue, &local_ref.scheduled) {
+                    use std::sync::atomic::Ordering;
+                    if !scheduled.swap(true, Ordering::AcqRel) {
+                        wq.push(local_ref.address.clone());
+                    }
+                }
+                Ok(())
+            }
+            ActorRefInner::Remote(_) => Err(ActorError::MessageDeliveryFailed(
+                "Remote actor stop not yet implemented".to_string(),
+            )),
+        }
+    }
 }
 
 impl<M: Message> LocalActorRef<M> {

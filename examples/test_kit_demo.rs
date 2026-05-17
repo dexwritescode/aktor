@@ -50,7 +50,9 @@ impl Default for CounterActor {
     }
 }
 
-impl Actor<TestMessage> for CounterActor {
+impl Actor for CounterActor {
+    type Msg = TestMessage;
+
     fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
         if let Some(counter_msg) = msg.extract::<CounterMessage>() {
             match counter_msg.operation {

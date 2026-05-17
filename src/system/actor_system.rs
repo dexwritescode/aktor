@@ -48,9 +48,7 @@ impl ActorSystemBuilder {
     }
 
     /// Build the actor system
-    pub async fn build<M: crate::Message>(
-        self,
-    ) -> Result<std::sync::Arc<ActorSystem<M>>, crate::ActorError> {
+    pub async fn build(self) -> Result<std::sync::Arc<ActorSystem>, crate::ActorError> {
         ActorSystem::new(self.config).await
     }
 }
@@ -77,7 +75,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_actor_system_builder() {
-        let system: std::sync::Arc<ActorSystem<TestMessage>> = ActorSystemBuilder::new()
+        let system: std::sync::Arc<ActorSystem> = ActorSystemBuilder::new()
             .with_max_actors(50000)
             .with_mailbox_size(500)
             .build()
@@ -91,7 +89,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distributed_config() {
-        let system: std::sync::Arc<ActorSystem<TestMessage>> = ActorSystemBuilder::new()
+        let system: std::sync::Arc<ActorSystem> = ActorSystemBuilder::new()
             .with_distributed("0.0.0.0:8080".to_string())
             .with_seed_nodes(vec!["node1:8080".to_string(), "node2:8080".to_string()])
             .build()

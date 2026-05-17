@@ -84,7 +84,7 @@ impl ResponseChannel {
 
 /// Core ask function - sends a message and waits for a response
 pub async fn ask<M, R>(
-    _system: &ActorSystem<M>,
+    _system: &ActorSystem,
     actor_ref: &ActorRef<M>,
     message: M,
     timeout_duration: Duration,
