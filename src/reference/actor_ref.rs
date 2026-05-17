@@ -1,4 +1,5 @@
 use crate::ask::AskRequest;
+use crate::system::SystemMessage;
 use crate::{ActorAddress, ActorError, AskError, Message};
 use async_trait::async_trait;
 use std::fmt;
@@ -33,6 +34,8 @@ enum ActorRefInner<M: Message> {
 pub struct LocalActorRef<M: Message> {
     /// Channel sender for message delivery
     sender: mpsc::UnboundedSender<ActorMessage<M>>,
+    /// Channel sender for system-level signals (PoisonPill, Watch, etc.)
+    system_sender: Option<mpsc::UnboundedSender<SystemMessage>>,
     /// Actor lifecycle state
     state: Arc<RwLock<ActorState>>,
     /// Actor address for reactive scheduling
@@ -117,6 +120,7 @@ impl<M: Message> ActorRef<M> {
             address: address.clone(),
             inner: ActorRefInner::Local(LocalActorRef {
                 sender,
+                system_sender: None,
                 state: Arc::new(RwLock::new(ActorState::Starting)),
                 address,
                 work_queue: None,
@@ -134,6 +138,16 @@ impl<M: Message> ActorRef<M> {
         if let ActorRefInner::Local(ref mut local_ref) = self.inner {
             local_ref.work_queue = Some(work_queue);
             local_ref.scheduled = Some(scheduled);
+        }
+    }
+
+    /// Set the system message sender (called by ActorSystem after creation)
+    pub(crate) fn set_system_sender(
+        &mut self,
+        system_sender: mpsc::UnboundedSender<SystemMessage>,
+    ) {
+        if let ActorRefInner::Local(ref mut local_ref) = self.inner {
+            local_ref.system_sender = Some(system_sender);
         }
     }
 
@@ -203,17 +217,27 @@ impl<M: Message> ActorRef<M> {
     pub async fn stop(&self) -> Result<(), ActorError> {
         match &self.inner {
             ActorRefInner::Local(local_ref) => {
-                let mut state = local_ref.state.write().await;
-                *state = ActorState::Stopping;
-                // TODO: Send stop message to actor
+                let sender = local_ref.system_sender.as_ref().ok_or_else(|| {
+                    ActorError::MessageDeliveryFailed(
+                        "Actor system sender not initialised".to_string(),
+                    )
+                })?;
+                sender.send(SystemMessage::PoisonPill).map_err(|_| {
+                    ActorError::MessageDeliveryFailed("System channel closed".to_string())
+                })?;
+                // Wake the actor so the worker loop sees the PoisonPill even if
+                // the user mailbox is empty.
+                if let (Some(wq), Some(scheduled)) = (&local_ref.work_queue, &local_ref.scheduled) {
+                    use std::sync::atomic::Ordering;
+                    if !scheduled.swap(true, Ordering::AcqRel) {
+                        wq.push(local_ref.address.clone());
+                    }
+                }
                 Ok(())
             }
-            ActorRefInner::Remote(_) => {
-                // TODO: Send remote stop message
-                Err(ActorError::MessageDeliveryFailed(
-                    "Remote actor stop not yet implemented".to_string(),
-                ))
-            }
+            ActorRefInner::Remote(_) => Err(ActorError::MessageDeliveryFailed(
+                "Remote actor stop not yet implemented".to_string(),
+            )),
         }
     }
 
