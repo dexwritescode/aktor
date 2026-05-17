@@ -1,45 +1,35 @@
 use crate::{ActorContext, ActorError, Message};
+use async_trait::async_trait;
 
-/// Core trait that all actors must implement
-/// Generic over the message type for type safety
+/// Core trait that all actors must implement.
+/// Generic over the message type for type safety.
 ///
-/// Actors can handle both Tell and Ask messages through the same handle() method.
-/// Use ctx.is_ask_request() to check if a response is expected.
-/// Use ctx.respond() to send responses for Ask messages.
-///
-/// This is a synchronous trait for maximum performance - no async overhead
+/// `handle` is synchronous — use `ctx.pipe_to_self(future)` for async I/O.
+/// `pre_start` is async and runs before the first message is dispatched.
+#[async_trait]
 pub trait Actor<M: Message>: Send + Sync + std::fmt::Debug + 'static {
-    /// Handle incoming messages synchronously (both Tell and Ask)
+    /// Handle incoming messages (both Tell and Ask).
     ///
-    /// For Ask messages:
-    /// - Use ctx.is_ask_request() to detect ask requests
-    /// - Use ctx.respond(response) to send responses back
-    /// - Ask messages MUST send a response, or the request will timeout
-    ///
-    /// For Tell messages:
-    /// - Process normally, no response needed
-    /// - ctx.respond() will return an error if called during Tell
-    ///
-    /// Note: This method is synchronous for maximum performance
+    /// For Ask messages: use `ctx.is_ask_request()` and `ctx.respond(response)`.
+    /// For async I/O: use `ctx.pipe_to_self(future)` — handle returns immediately
+    /// and the future result arrives as a subsequent message.
     fn handle(&mut self, msg: M, ctx: &ActorContext<M>);
 
-    /// Called when the actor is starting up
-    /// Use this for initialization logic
-    fn pre_start(&mut self, _ctx: &ActorContext<M>) -> Result<(), ActorError> {
+    /// Called once before the first message is dispatched.
+    /// Spawn children, open connections, or load initial state here.
+    async fn pre_start(&mut self, _ctx: &ActorContext<M>) -> Result<(), ActorError> {
         Ok(())
     }
 
-    /// Called when the actor is shutting down
-    /// Use this for cleanup logic
+    /// Called when the actor is shutting down. Use for cleanup.
     fn post_stop(&mut self, _ctx: &ActorContext<M>) -> Result<(), ActorError> {
         Ok(())
     }
 
-    /// Called when the actor encounters an error
-    /// Return true to restart, false to stop
+    /// Called when the actor encounters an error. Return true to restart, false to stop.
     fn on_error(&mut self, error: &ActorError, _ctx: &ActorContext<M>) -> bool {
         tracing::error!("Actor error: {}", error);
-        false // Default: stop on error
+        false
     }
 }
 
@@ -218,6 +208,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Actor<TestMessage> for TestActor {
         fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
             self.received_messages.push(msg.content);
