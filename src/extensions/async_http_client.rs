@@ -76,9 +76,7 @@ impl AsyncHttpClientExtension {
     }
 
     fn build(builder: reqwest::ClientBuilder) -> Self {
-        let client = builder
-            .build()
-            .expect("failed to build async HTTP client");
+        let client = builder.build().expect("failed to build async HTTP client");
         Self {
             client: Arc::new(client),
         }
@@ -155,7 +153,10 @@ mod tests {
             resp.status()
         );
         let body = resp.text().await.expect("body should be readable");
-        assert!(body.contains("httpbin.org"), "expected httpbin.org in response body");
+        assert!(
+            body.contains("httpbin.org"),
+            "expected httpbin.org in response body"
+        );
     }
 
     /// A DNS lookup for a guaranteed-nonexistent domain must fail.
