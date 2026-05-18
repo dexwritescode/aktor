@@ -7,6 +7,9 @@
 //! use aktor::prelude::*;
 //! ```
 
+// Extensions
+pub use crate::extensions::{AsyncHttpClientExtension, HttpClientExtension};
+
 // Core traits and types
 pub use crate::core::{Actor, ActorError, ActorProps, Message};
 
