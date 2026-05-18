@@ -88,9 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn status actor
     let status_actor = StatusActor::default();
-    let actor_ref = system
-        .spawn_actor("status-actor", status_actor, ActorProps::default())
-        .await?;
+    let actor_ref = system.spawn_actor("status-actor", status_actor, ActorProps::default())?;
 
     // Give the actor time to start
     sleep(Duration::from_millis(100)).await;

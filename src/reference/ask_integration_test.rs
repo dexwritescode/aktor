@@ -2,7 +2,7 @@
 mod tests {
     use crate::reference::ask::{AskRequest, ResponseChannel};
     use crate::{Actor, ActorContext, ActorSystem, ActorSystemConfig, Message};
-    use async_trait::async_trait;
+
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -39,7 +39,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Actor for EchoActor {
         type Msg = EchoMessage;
 
@@ -71,7 +70,6 @@ mod tests {
         let echo_actor = EchoActor::default();
         let actor_ref = system
             .spawn_actor("echo-actor", echo_actor, crate::ActorProps::default())
-            .await
             .unwrap();
 
         // Give the actor time to start
@@ -107,7 +105,6 @@ mod tests {
         let echo_actor = EchoActor::default();
         let actor_ref = system
             .spawn_actor("echo-ext-actor", echo_actor, crate::ActorProps::default())
-            .await
             .unwrap();
 
         // Give the actor time to start
@@ -197,7 +194,6 @@ mod tests {
         let echo_actor = EchoActor::default();
         let actor_ref = system
             .spawn_actor("tell-actor", echo_actor, crate::ActorProps::default())
-            .await
             .unwrap();
 
         // Give the actor time to start
@@ -223,7 +219,6 @@ mod tests {
         let echo_actor = EchoActor::default();
         let actor_ref = system
             .spawn_actor("timeout-actor", echo_actor, crate::ActorProps::default())
-            .await
             .unwrap();
 
         // Give the actor time to start

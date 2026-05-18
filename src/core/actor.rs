@@ -1,5 +1,4 @@
 use crate::{ActorContext, ActorError, Message};
-use async_trait::async_trait;
 
 /// Core trait that all actors must implement.
 ///
@@ -8,8 +7,8 @@ use async_trait::async_trait;
 /// forcing the actor system to be generic over `M`.
 ///
 /// `handle` is synchronous — use `ctx.pipe_to_self(future)` for async I/O.
-/// `pre_start` is async and runs before the first message is dispatched.
-#[async_trait]
+/// `pre_start` is synchronous; for async init, call `ctx.pipe_to_self(future)`
+/// and handle the result as the first incoming message.
 pub trait Actor: Send + Sync + std::fmt::Debug + 'static {
     type Msg: Message;
 
@@ -21,8 +20,8 @@ pub trait Actor: Send + Sync + std::fmt::Debug + 'static {
     fn handle(&mut self, msg: Self::Msg, ctx: &ActorContext<Self::Msg>);
 
     /// Called once before the first message is dispatched.
-    /// Spawn children, open connections, or load initial state here.
-    async fn pre_start(&mut self, _ctx: &ActorContext<Self::Msg>) -> Result<(), ActorError> {
+    /// Spawn children or set up initial state here.
+    fn pre_start(&mut self, _ctx: &ActorContext<Self::Msg>) -> Result<(), ActorError> {
         Ok(())
     }
 
@@ -195,7 +194,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Actor for TestActor {
         type Msg = TestMessage;
 

@@ -6,8 +6,8 @@ use crate::system::{
 };
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -66,7 +66,7 @@ pub struct ActorContext<M: Message> {
     /// Reference to the non-generic actor system.
     pub system: Arc<ActorSystem>,
     /// Children spawned by this actor (type-erased for heterogeneous message types).
-    children: Arc<RwLock<HashMap<String, Box<dyn AnyActorRef>>>>,
+    children: Arc<Mutex<HashMap<String, Box<dyn AnyActorRef>>>>,
     /// Parent actor address (if this is a child actor).
     parent: Option<ActorAddress>,
     props: ActorProps,
@@ -320,7 +320,7 @@ impl<M: Message> ActorContext<M> {
         Self {
             actor_ref,
             system,
-            children: Arc::new(RwLock::new(HashMap::new())),
+            children: Arc::new(Mutex::new(HashMap::new())),
             parent,
             props,
             response_capability: None,
@@ -391,7 +391,8 @@ impl<M: Message> ActorContext<M> {
     }
 
     /// Spawn a child actor. The child can have any `Actor` type and message type.
-    pub async fn spawn_child<A: Actor>(
+    /// Callable from both `pre_start` and `handle` — no `.await` needed.
+    pub fn spawn_child<A: Actor>(
         &self,
         name: &str,
         actor: A,
@@ -407,26 +408,22 @@ impl<M: Message> ActorContext<M> {
 
         let parent_addr = Some(self.actor_ref.address().clone());
 
-        let child_ref = self
-            .system
-            .spawn_actor_with_address(child_address, actor, props, parent_addr)
-            .await?;
+        let child_ref =
+            self.system
+                .spawn_actor_with_address(child_address, actor, props, parent_addr)?;
 
-        {
-            let mut children = self.children.write().await;
-            children.insert(name.to_string(), Box::new(child_ref.clone()));
-        }
+        self.children
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), Box::new(child_ref.clone()));
 
         info!("Spawned child actor: {}", child_ref.address());
         Ok(child_ref)
     }
 
     /// Stop a named child actor.
-    pub async fn stop_child(&self, name: &str) -> Result<(), ActorError> {
-        let child = {
-            let mut children = self.children.write().await;
-            children.remove(name)
-        };
+    pub fn stop_child(&self, name: &str) -> Result<(), ActorError> {
+        let child = self.children.lock().unwrap().remove(name);
         if let Some(child_ref) = child {
             child_ref.stop_now()?;
             debug!("Stopped child actor: {}", name);
@@ -435,11 +432,8 @@ impl<M: Message> ActorContext<M> {
     }
 
     /// Stop all child actors.
-    pub async fn stop_all_children(&self) -> Result<(), ActorError> {
-        let children = {
-            let mut guard = self.children.write().await;
-            std::mem::take(&mut *guard)
-        };
+    pub fn stop_all_children(&self) -> Result<(), ActorError> {
+        let children = std::mem::take(&mut *self.children.lock().unwrap());
         for (name, child) in children {
             if let Err(e) = child.stop_now() {
                 error!("Failed to stop child actor {}: {}", name, e);
@@ -570,7 +564,7 @@ impl ActorSystem {
     }
 
     /// Spawn an actor with an auto-generated address.
-    pub async fn spawn_actor<A: Actor>(
+    pub fn spawn_actor<A: Actor>(
         self: &Arc<Self>,
         name: &str,
         actor: A,
@@ -582,11 +576,10 @@ impl ActorSystem {
             .map_err(|e| ActorError::ActorCreationFailed(e.to_string()))?;
 
         self.spawn_actor_with_address(address, actor, props, None)
-            .await
     }
 
     /// Spawn an actor at a specific address with an optional parent address.
-    pub async fn spawn_actor_with_address<A: Actor>(
+    pub fn spawn_actor_with_address<A: Actor>(
         self: &Arc<Self>,
         address: ActorAddress,
         mut actor: A,
@@ -619,7 +612,7 @@ impl ActorSystem {
             stop_requested.clone(),
         ));
 
-        if let Err(e) = actor.pre_start(&context).await {
+        if let Err(e) = actor.pre_start(&context) {
             return Err(ActorError::ActorCreationFailed(format!(
                 "Actor pre_start failed: {}",
                 e
@@ -644,16 +637,15 @@ impl ActorSystem {
     }
 
     /// Spawn a `Default` actor by type.
-    pub async fn actor_of<A: Actor + Default>(
+    pub fn actor_of<A: Actor + Default>(
         self: &Arc<Self>,
         name: &str,
     ) -> Result<ActorRef<A::Msg>, ActorError> {
         self.spawn_actor(name, A::default(), ActorProps::default())
-            .await
     }
 
     /// Spawn an actor using the `ActorFactoryArgs` trait.
-    pub async fn actor_of_args<A, Args>(
+    pub fn actor_of_args<A, Args>(
         self: &Arc<Self>,
         name: &str,
         args: Args,
@@ -663,20 +655,20 @@ impl ActorSystem {
         Args: Send + 'static,
     {
         let actor = A::create_args(args);
-        self.spawn_actor(name, actor, ActorProps::default()).await
+        self.spawn_actor(name, actor, ActorProps::default())
     }
 
     /// Spawn a `Default` actor with custom props.
-    pub async fn actor_of_props<A: Actor + Default>(
+    pub fn actor_of_props<A: Actor + Default>(
         self: &Arc<Self>,
         name: &str,
         props: ActorProps,
     ) -> Result<ActorRef<A::Msg>, ActorError> {
-        self.spawn_actor(name, A::default(), props).await
+        self.spawn_actor(name, A::default(), props)
     }
 
     /// Spawn an actor with args and custom props.
-    pub async fn actor_of_args_props<A, Args>(
+    pub fn actor_of_args_props<A, Args>(
         self: &Arc<Self>,
         name: &str,
         args: Args,
@@ -687,7 +679,7 @@ impl ActorSystem {
         Args: Send + 'static,
     {
         let actor = A::create_args(args);
-        self.spawn_actor(name, actor, props).await
+        self.spawn_actor(name, actor, props)
     }
 
     /// Returns true if an actor at `address` is currently alive in the system.
@@ -741,7 +733,6 @@ impl ActorSystem {
 mod tests {
     use super::*;
     use crate::{Actor, ActorError, Message};
-    use async_trait::async_trait;
 
     #[derive(Debug, Clone)]
     struct TestMessage {
@@ -769,7 +760,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Actor for TestActor {
         type Msg = TestMessage;
 
@@ -794,10 +784,7 @@ mod tests {
         let actor = TestActor::default();
         let props = ActorProps::default();
 
-        let actor_ref = system
-            .spawn_actor("test-actor", actor, props)
-            .await
-            .unwrap();
+        let actor_ref = system.spawn_actor("test-actor", actor, props).unwrap();
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("test-actor"));
     }
@@ -810,10 +797,7 @@ mod tests {
         let actor = TestActor::default();
         let props = ActorProps::default();
 
-        let actor_ref = system
-            .spawn_actor("test-actor", actor, props)
-            .await
-            .unwrap();
+        let actor_ref = system.spawn_actor("test-actor", actor, props).unwrap();
 
         let message = TestMessage {
             data: "Hello".to_string(),
@@ -842,7 +826,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Actor for ParameterizedActor {
         type Msg = TestMessage;
 
@@ -856,7 +839,7 @@ mod tests {
         let config = ActorSystemConfig::default();
         let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
-        let actor_ref = system.actor_of::<TestActor>("test-actor").await.unwrap();
+        let actor_ref = system.actor_of::<TestActor>("test-actor").unwrap();
 
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("test-actor"));
@@ -878,7 +861,6 @@ mod tests {
         let args = ("worker".to_string(), 42);
         let actor_ref = system
             .actor_of_args::<ParameterizedActor, _>("param-actor", args)
-            .await
             .unwrap();
 
         assert!(actor_ref.is_local());
@@ -934,7 +916,6 @@ mod tests {
 
         let actor_ref = system
             .actor_of_props::<TestActor>("props-actor", props)
-            .await
             .unwrap();
 
         assert!(actor_ref.is_local());
@@ -960,7 +941,6 @@ mod tests {
 
         let actor_ref = system
             .actor_of_args_props::<ParameterizedActor, _>("args-props-actor", args, props)
-            .await
             .unwrap();
 
         assert!(actor_ref.is_local());
@@ -979,10 +959,9 @@ mod tests {
         let config = ActorSystemConfig::default();
         let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
-        let default_actor = system.actor_of::<TestActor>("default").await.unwrap();
+        let default_actor = system.actor_of::<TestActor>("default").unwrap();
         let param_actor = system
             .actor_of_args::<ParameterizedActor, _>("parameterized", ("worker-1".to_string(), 10))
-            .await
             .unwrap();
 
         assert!(default_actor.is_local());
@@ -1006,10 +985,10 @@ mod tests {
         let config = ActorSystemConfig::default();
         let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
 
-        let actor1 = system.actor_of::<TestActor>("unique-name").await.unwrap();
+        let actor1 = system.actor_of::<TestActor>("unique-name").unwrap();
         assert!(actor1.is_local());
 
-        let result = system.actor_of::<TestActor>("unique-name").await;
+        let result = system.actor_of::<TestActor>("unique-name");
         assert!(result.is_err());
 
         if let Err(ActorError::ActorCreationFailed(msg)) = result {
@@ -1025,13 +1004,12 @@ mod tests {
         captured: Arc<std::sync::Mutex<Option<String>>>,
     }
 
-    #[async_trait]
     impl Actor for ParentProbeActor {
         type Msg = TestMessage;
 
         fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
 
-        async fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+        fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
             *self.captured.lock().unwrap() = ctx.parent_address().map(|a| a.to_string());
             Ok(())
         }
@@ -1052,7 +1030,6 @@ mod tests {
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         assert!(captured.lock().unwrap().is_none());
@@ -1066,7 +1043,6 @@ mod tests {
 
         let parent_ref = system
             .spawn_actor("parent", TestActor::default(), ActorProps::default())
-            .await
             .unwrap();
 
         let captured = Arc::new(std::sync::Mutex::new(None::<String>));
@@ -1080,10 +1056,9 @@ mod tests {
                 ActorProps::default(),
                 Some(parent_ref.address().clone()),
             )
-            .await
             .unwrap();
 
-        // pre_start is awaited inside spawn_actor_with_address
+        // pre_start runs synchronously inside spawn_actor_with_address
         assert_eq!(
             *captured.lock().unwrap(),
             Some(parent_ref.address().to_string())
@@ -1093,7 +1068,6 @@ mod tests {
     #[derive(Debug, Default)]
     struct SelfStoppingActor;
 
-    #[async_trait]
     impl Actor for SelfStoppingActor {
         type Msg = TestMessage;
 
@@ -1110,7 +1084,6 @@ mod tests {
 
         let actor_ref = system
             .spawn_actor("self-stopper", SelfStoppingActor, ActorProps::default())
-            .await
             .unwrap();
 
         actor_ref
@@ -1133,7 +1106,6 @@ mod tests {
 
         let actor_ref = system
             .spawn_actor("pill-target", TestActor::default(), ActorProps::default())
-            .await
             .unwrap();
 
         actor_ref.stop().await.unwrap();
@@ -1157,7 +1129,6 @@ mod tests {
             counter: Arc<AtomicUsize>,
         }
 
-        #[async_trait]
         impl Actor for CountingActor {
             type Msg = TestMessage;
 
@@ -1178,7 +1149,6 @@ mod tests {
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         const MSG_COUNT: usize = 25;
@@ -1203,55 +1173,43 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct AsyncPreStartActor {
-        initialized: Arc<std::sync::Mutex<bool>>,
-        pre_start_child_address: Arc<std::sync::Mutex<Option<String>>>,
+    struct PreStartChildActor {
+        child_address: Arc<std::sync::Mutex<Option<String>>>,
     }
 
-    #[async_trait]
-    impl Actor for AsyncPreStartActor {
+    impl Actor for PreStartChildActor {
         type Msg = TestMessage;
 
         fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
 
-        async fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
-            tokio::task::yield_now().await;
-            *self.initialized.lock().unwrap() = true;
-
-            let child = ctx.spawn_child("child", TestActor::default(), None).await?;
-            *self.pre_start_child_address.lock().unwrap() = Some(child.address().to_string());
+        fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+            let child = ctx.spawn_child("child", TestActor::default(), None)?;
+            *self.child_address.lock().unwrap() = Some(child.address().to_string());
             Ok(())
         }
     }
 
     #[tokio::test]
-    async fn test_async_pre_start_runs_before_first_message() {
+    async fn test_pre_start_runs_before_first_message() {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
 
-        let initialized = Arc::new(std::sync::Mutex::new(false));
         let child_addr = Arc::new(std::sync::Mutex::new(None::<String>));
 
         system
             .spawn_actor(
-                "async-init",
-                AsyncPreStartActor {
-                    initialized: initialized.clone(),
-                    pre_start_child_address: child_addr.clone(),
+                "pre-start-actor",
+                PreStartChildActor {
+                    child_address: child_addr.clone(),
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         assert!(
-            *initialized.lock().unwrap(),
-            "pre_start async work must complete before spawn returns"
-        );
-        assert!(
             child_addr.lock().unwrap().is_some(),
-            "child spawned in async pre_start must be registered before spawn returns"
+            "child spawned in pre_start must be registered before spawn_actor returns"
         );
     }
 
@@ -1260,7 +1218,6 @@ mod tests {
         phase: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
-    #[async_trait]
     impl Actor for PipeActor {
         type Msg = TestMessage;
 
@@ -1295,7 +1252,6 @@ mod tests {
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         actor_ref
@@ -1331,7 +1287,6 @@ mod tests {
             count: Arc<std::sync::atomic::AtomicUsize>,
         }
 
-        #[async_trait]
         impl Actor for CountActor {
             type Msg = TestMessage;
 
@@ -1353,7 +1308,6 @@ mod tests {
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         actor_ref
@@ -1389,7 +1343,6 @@ mod tests {
             gate: Arc<tokio::sync::Notify>,
         }
 
-        #[async_trait]
         impl Actor for InterleavingActor {
             type Msg = TestMessage;
 
@@ -1418,7 +1371,6 @@ mod tests {
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         actor_ref
@@ -1504,7 +1456,6 @@ mod tests {
             counter: Arc<AtomicUsize>,
         }
 
-        #[async_trait]
         impl Actor for TimerActor {
             type Msg = TestMessage;
 
@@ -1535,7 +1486,6 @@ mod tests {
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         actor_ref
@@ -1576,7 +1526,6 @@ mod tests {
             target: ActorRef<TestMessage>,
         }
 
-        #[async_trait]
         impl Actor for SenderActor {
             type Msg = TestMessage;
 
@@ -1596,7 +1545,6 @@ mod tests {
             counter: Arc<AtomicUsize>,
         }
 
-        #[async_trait]
         impl Actor for ReceiverActor {
             type Msg = TestMessage;
 
@@ -1617,7 +1565,6 @@ mod tests {
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         let sender_ref = system
@@ -1628,7 +1575,6 @@ mod tests {
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         sender_ref
@@ -1662,7 +1608,6 @@ mod tests {
             counter: Arc<AtomicUsize>,
         }
 
-        #[async_trait]
         impl Actor for MultiTimerActor {
             type Msg = TestMessage;
 
@@ -1698,7 +1643,6 @@ mod tests {
                 },
                 ActorProps::default(),
             )
-            .await
             .unwrap();
 
         actor_ref

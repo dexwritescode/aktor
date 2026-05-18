@@ -124,13 +124,11 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
             // i
         );
 
-        let actor_ref = system
-            .spawn_actor(
-                &format!("bench-actor-{}", i),
-                actor,
-                ActorProps::new().with_mailbox_size(10000),
-            )
-            .await?;
+        let actor_ref = system.spawn_actor(
+            &format!("bench-actor-{}", i),
+            actor,
+            ActorProps::new().with_mailbox_size(10000),
+        )?;
 
         actor_refs.push(actor_ref);
     }
