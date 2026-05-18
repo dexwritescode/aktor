@@ -19,8 +19,6 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
 
     steps:
       - uses: actions/checkout@v4
@@ -60,11 +58,3 @@ jobs:
           output: both
         continue-on-error: true
 
-      - name: Post coverage comment
-        uses: marocchino/sticky-pull-request-comment@v2
-        if: github.event_name == 'pull_request'
-        with:
-          recreate: true
-          path: code-coverage-results.md
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
