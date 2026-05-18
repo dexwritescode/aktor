@@ -668,7 +668,7 @@ mod tests {
     #[tokio::test]
     async fn test_ask_pattern_with_test_kit() {
         let test_kit = ActorTestKit::new().await;
-        let echo = test_kit.spawn(EchoActor, "echo").await.unwrap();
+        let echo = test_kit.spawn(EchoActor, "echo").unwrap();
 
         let message = EchoMessage {
             content: "ask test".to_string(),
