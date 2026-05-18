@@ -58,7 +58,13 @@ jobs:
           badge: false
           format: markdown
           output: both
-          add_comment: true
+        continue-on-error: true
+
+      - name: Post coverage comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        if: github.event_name == 'pull_request'
+        with:
+          recreate: true
+          path: code-coverage-results.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
