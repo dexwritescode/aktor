@@ -116,7 +116,7 @@ async fn asynchronous_testing_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("Creating ActorTestKit for integration testing...");
 
     let test_kit = ActorTestKit::new().await;
-    let counter = test_kit.spawn(CounterActor::default(), "counter").await?;
+    let counter = test_kit.spawn(CounterActor::default(), "counter")?;
 
     println!("✅ Counter actor spawned successfully");
 
@@ -156,9 +156,7 @@ async fn ask_pattern_testing_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing ask pattern with ActorTestKit...");
 
     let test_kit = ActorTestKit::new().await;
-    let counter = test_kit
-        .spawn(CounterActor::default(), "ask-counter")
-        .await?;
+    let counter = test_kit.spawn(CounterActor::default(), "ask-counter")?;
 
     // Increment a few times
     counter.tell(

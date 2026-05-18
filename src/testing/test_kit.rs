@@ -235,24 +235,18 @@ impl ActorTestKit {
     }
 
     /// Spawn an actor in the test environment
-    pub async fn spawn<A: Actor>(
-        &self,
-        actor: A,
-        name: &str,
-    ) -> Result<ActorRef<A::Msg>, ActorError> {
-        self.system
-            .spawn_actor(name, actor, ActorProps::default())
-            .await
+    pub fn spawn<A: Actor>(&self, actor: A, name: &str) -> Result<ActorRef<A::Msg>, ActorError> {
+        self.system.spawn_actor(name, actor, ActorProps::default())
     }
 
     /// Spawn an actor with custom props
-    pub async fn spawn_with_props<A: Actor>(
+    pub fn spawn_with_props<A: Actor>(
         &self,
         actor: A,
         name: &str,
         props: ActorProps,
     ) -> Result<ActorRef<A::Msg>, ActorError> {
-        self.system.spawn_actor(name, actor, props).await
+        self.system.spawn_actor(name, actor, props)
     }
 
     /// Create a test probe for capturing messages of type M
@@ -268,7 +262,6 @@ impl ActorTestKit {
 
         let actor_ref = self
             .spawn(probe_actor, &format!("test-probe-{}", probe_id))
-            .await
             .expect("Failed to spawn test probe actor");
 
         let probe = Arc::new(TestProbe {
@@ -573,7 +566,6 @@ impl<M: Message> MockActorContext<M> {
 mod tests {
     use super::*;
     use crate::{Actor, ActorContext, ActorError, Message};
-    use async_trait::async_trait;
 
     #[derive(Debug, Clone, PartialEq)]
     struct EchoMessage {
@@ -589,7 +581,6 @@ mod tests {
     #[derive(Debug)]
     struct EchoActor;
 
-    #[async_trait]
     impl Actor for EchoActor {
         type Msg = TestMessage;
 
@@ -638,7 +629,7 @@ mod tests {
         let test_kit = ActorTestKit::new().await;
         let probe = test_kit.create_test_probe::<EchoMessage>().await;
 
-        let _echo = test_kit.spawn(EchoActor, "echo").await.unwrap();
+        let _echo = test_kit.spawn(EchoActor, "echo").unwrap();
 
         let message = EchoMessage {
             content: "test".to_string(),
