@@ -27,6 +27,14 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache rustup toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.rustup/toolchains
+          key: rustup-${{ runner.os }}-stable-llvm-tools
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
