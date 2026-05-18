@@ -51,4 +51,6 @@ jobs:
           format: markdown
           output: both
           add_comment: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
