@@ -483,13 +483,16 @@ impl<M: Message> ActorContext<M> {
         &self.props
     }
 
-    /// Schedule a one-shot message delivery after `delay`.
-    pub async fn schedule_once(
+    /// Schedule a one-shot message delivery to `target` after `delay`.
+    ///
+    /// Callable directly from `handle` — no `.await` needed. Internally
+    /// spawns a Tokio task and returns immediately, same shape as `pipe_to_self`.
+    pub fn schedule_once(
         &self,
         delay: std::time::Duration,
         target: &ActorRef<M>,
         message: M,
-    ) -> Result<Uuid, ActorError> {
+    ) -> Uuid {
         let target = target.clone();
         let sender = Some(self.actor_ref.clone());
         let task_id = Uuid::new_v4();
@@ -501,7 +504,27 @@ impl<M: Message> ActorContext<M> {
             }
         });
 
-        Ok(task_id)
+        task_id
+    }
+
+    /// Schedule a one-shot message back to this actor's own mailbox after `delay`.
+    ///
+    /// The Akka `timers.startSingleTimer` equivalent — synchronous at the call site,
+    /// message arrives through the normal mailbox after the delay expires.
+    ///
+    /// ```ignore
+    /// fn handle(&mut self, msg: DomainMsg, ctx: &ActorContext<DomainMsg>) {
+    ///     match msg {
+    ///         DomainMsg::Queue(url) => {
+    ///             self.pending.push_back(url);
+    ///             ctx.schedule_to_self(self.crawl_delay, DomainMsg::Dispatch);
+    ///         }
+    ///         DomainMsg::Dispatch => { /* send next URL to crawler */ }
+    ///     }
+    /// }
+    /// ```
+    pub fn schedule_to_self(&self, delay: std::time::Duration, message: M) -> Uuid {
+        self.schedule_once(delay, &self.actor_ref.clone(), message)
     }
 }
 
@@ -1465,6 +1488,247 @@ mod tests {
             piped_pos > msg_b_pos && piped_pos > msg_c_pos,
             "piped must appear after msg-b and msg-c, got: {:?}",
             observed
+        );
+    }
+
+    // Verifies that schedule_to_self delivers a message to the actor after the
+    // given delay without requiring .await in handle().
+    #[tokio::test]
+    async fn test_schedule_to_self_delivers_after_delay() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        #[derive(Debug)]
+        struct TimerActor {
+            counter: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Actor for TimerActor {
+            type Msg = TestMessage;
+
+            fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+                if msg.data == "start" {
+                    // schedule_to_self is sync — no .await
+                    ctx.schedule_to_self(
+                        std::time::Duration::from_millis(20),
+                        TestMessage {
+                            data: "tick".into(),
+                        },
+                    );
+                } else if msg.data == "tick" {
+                    self.counter.fetch_add(1, AOrdering::Relaxed);
+                }
+            }
+        }
+
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let actor_ref = system
+            .spawn_actor(
+                "timer-actor",
+                TimerActor {
+                    counter: counter.clone(),
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "start".into(),
+                },
+                None,
+            )
+            .unwrap();
+
+        // Before delay expires counter should still be zero.
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            0,
+            "tick must not arrive before delay"
+        );
+
+        // After delay expires the tick message should have been delivered.
+        tokio::time::sleep(tokio::time::Duration::from_millis(40)).await;
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            1,
+            "tick must arrive after delay"
+        );
+    }
+
+    // schedule_once can target a different actor (cross-actor scheduling).
+    #[tokio::test]
+    async fn test_schedule_once_cross_actor() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        #[derive(Debug)]
+        struct SenderActor {
+            target: ActorRef<TestMessage>,
+        }
+
+        #[async_trait]
+        impl Actor for SenderActor {
+            type Msg = TestMessage;
+
+            fn handle(&mut self, _msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+                ctx.schedule_once(
+                    std::time::Duration::from_millis(20),
+                    &self.target,
+                    TestMessage {
+                        data: "ping".into(),
+                    },
+                );
+            }
+        }
+
+        #[derive(Debug)]
+        struct ReceiverActor {
+            counter: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Actor for ReceiverActor {
+            type Msg = TestMessage;
+
+            fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+                self.counter.fetch_add(1, AOrdering::Relaxed);
+            }
+        }
+
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let receiver_ref = system
+            .spawn_actor(
+                "receiver-actor",
+                ReceiverActor {
+                    counter: counter.clone(),
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        let sender_ref = system
+            .spawn_actor(
+                "sender-actor",
+                SenderActor {
+                    target: receiver_ref,
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        sender_ref
+            .tell(TestMessage { data: "go".into() }, None)
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            0,
+            "must not arrive before delay"
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(40)).await;
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            1,
+            "must arrive after delay"
+        );
+    }
+
+    // Multiple schedule_to_self calls from one handle invocation fire independently.
+    #[tokio::test]
+    async fn test_schedule_to_self_multiple_timers() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        #[derive(Debug)]
+        struct MultiTimerActor {
+            counter: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Actor for MultiTimerActor {
+            type Msg = TestMessage;
+
+            fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+                if msg.data == "start" {
+                    ctx.schedule_to_self(
+                        std::time::Duration::from_millis(20),
+                        TestMessage {
+                            data: "tick".into(),
+                        },
+                    );
+                    ctx.schedule_to_self(
+                        std::time::Duration::from_millis(40),
+                        TestMessage {
+                            data: "tick".into(),
+                        },
+                    );
+                } else if msg.data == "tick" {
+                    self.counter.fetch_add(1, AOrdering::Relaxed);
+                }
+            }
+        }
+
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let actor_ref = system
+            .spawn_actor(
+                "multi-timer-actor",
+                MultiTimerActor {
+                    counter: counter.clone(),
+                },
+                ActorProps::default(),
+            )
+            .await
+            .unwrap();
+
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "start".into(),
+                },
+                None,
+            )
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            0,
+            "neither tick should have fired yet"
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            1,
+            "first tick should have fired"
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            2,
+            "both ticks should have fired"
         );
     }
 }
