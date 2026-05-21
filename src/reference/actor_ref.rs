@@ -38,12 +38,6 @@ pub struct LocalActorRef<M: Message> {
     system_sender: Option<mpsc::UnboundedSender<SystemMessage>>,
     /// Actor lifecycle state
     state: Arc<RwLock<ActorState>>,
-    /// Actor address for reactive scheduling
-    address: ActorAddress,
-    /// Work queue for reactive scheduling
-    work_queue: Option<Arc<crossbeam::deque::Injector<ActorAddress>>>,
-    /// Scheduled flag to prevent duplicate scheduling
-    scheduled: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Remote actor reference implementation
@@ -122,22 +116,7 @@ impl<M: Message> ActorRef<M> {
                 sender,
                 system_sender: None,
                 state: Arc::new(RwLock::new(ActorState::Starting)),
-                address,
-                work_queue: None,
-                scheduled: None,
             }),
-        }
-    }
-
-    /// Set reactive scheduling components (called by ActorSystem after creation)
-    pub(crate) fn set_scheduling(
-        &mut self,
-        work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
-        scheduled: Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        if let ActorRefInner::Local(ref mut local_ref) = self.inner {
-            local_ref.work_queue = Some(work_queue);
-            local_ref.scheduled = Some(scheduled);
         }
     }
 
@@ -224,16 +203,7 @@ impl<M: Message> ActorRef<M> {
                 })?;
                 sender.send(SystemMessage::PoisonPill).map_err(|_| {
                     ActorError::MessageDeliveryFailed("System channel closed".to_string())
-                })?;
-                // Wake the actor so the worker loop sees the PoisonPill even if
-                // the user mailbox is empty.
-                if let (Some(wq), Some(scheduled)) = (&local_ref.work_queue, &local_ref.scheduled) {
-                    use std::sync::atomic::Ordering;
-                    if !scheduled.swap(true, Ordering::AcqRel) {
-                        wq.push(local_ref.address.clone());
-                    }
-                }
-                Ok(())
+                })
             }
             ActorRefInner::Remote(_) => Err(ActorError::MessageDeliveryFailed(
                 "Remote actor stop not yet implemented".to_string(),
@@ -265,14 +235,7 @@ impl<M: Message> ActorRef<M> {
                     .send(crate::system::SystemMessage::PoisonPill)
                     .map_err(|_| {
                         ActorError::MessageDeliveryFailed("System channel closed".to_string())
-                    })?;
-                if let (Some(wq), Some(scheduled)) = (&local_ref.work_queue, &local_ref.scheduled) {
-                    use std::sync::atomic::Ordering;
-                    if !scheduled.swap(true, Ordering::AcqRel) {
-                        wq.push(local_ref.address.clone());
-                    }
-                }
-                Ok(())
+                    })
             }
             ActorRefInner::Remote(_) => Err(ActorError::MessageDeliveryFailed(
                 "Remote actor stop not yet implemented".to_string(),
@@ -282,22 +245,10 @@ impl<M: Message> ActorRef<M> {
 }
 
 impl<M: Message> LocalActorRef<M> {
-    /// Send a message to the local actor with reactive scheduling
     fn send(&self, message: ActorMessage<M>) -> Result<(), ActorError> {
         self.sender
             .send(message)
-            .map_err(|e| ActorError::MessageDeliveryFailed(e.to_string()))?;
-
-        // Reactively schedule actor if not already scheduled
-        if let (Some(work_queue), Some(scheduled)) = (&self.work_queue, &self.scheduled) {
-            // Use compare-and-swap to atomically check and set scheduled flag
-            if !scheduled.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                // Actor was not scheduled, push it to the work queue
-                work_queue.push(self.address.clone());
-            }
-        }
-
-        Ok(())
+            .map_err(|e| ActorError::MessageDeliveryFailed(e.to_string()))
     }
 
     /// Update the actor's state

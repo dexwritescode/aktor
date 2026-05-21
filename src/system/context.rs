@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -76,30 +76,18 @@ pub struct ActorContext<M: Message> {
 }
 
 // ------------------------------------------------------------------
-// Type-erased dispatch layer
+// Per-actor runner
 // ------------------------------------------------------------------
 
-enum RunResult {
-    Idle,
-    Stop,
-}
-
-/// Type-erased interface used by the worker loop to drive any actor.
-trait ActorRunner: Send + Sync {
-    fn run_batch(&mut self, batch_size: usize) -> RunResult;
-    fn do_post_stop(&mut self);
-}
-
-/// Concrete typed runner — owns the actor, its context, and its mailbox.
+/// Concrete typed runner — owns the actor, its context, and its mailboxes.
+/// Each actor gets its own tokio task that blocks on `recv().await`.
 struct ActorRunnerImpl<A: Actor> {
     actor: A,
     context: Arc<ActorContext<A::Msg>>,
     receiver: mpsc::UnboundedReceiver<crate::reference::ActorMessage<A::Msg>>,
     system_receiver: mpsc::UnboundedReceiver<SystemMessage>,
-    scheduled: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     address: ActorAddress,
-    work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
 }
 
 impl<A: Actor> ActorRunnerImpl<A> {
@@ -130,138 +118,49 @@ impl<A: Actor> ActorRunnerImpl<A> {
             }
         }
     }
-}
 
-impl<A: Actor> ActorRunner for ActorRunnerImpl<A> {
-    fn run_batch(&mut self, batch_size: usize) -> RunResult {
-        // Check system channel first — PoisonPill takes priority over user messages.
-        let mut should_stop = matches!(
-            self.system_receiver.try_recv(),
-            Ok(SystemMessage::PoisonPill)
-        );
-
-        if !should_stop {
-            let mut processed = 0;
-            while processed < batch_size {
-                match self.receiver.try_recv() {
-                    Ok(msg) => {
-                        self.dispatch_one(msg);
-                        processed += 1;
-                        if self.stop_requested.load(Ordering::Acquire) {
-                            should_stop = true;
-                            break;
+    async fn run(
+        mut self,
+        actor_storage: Arc<DashMap<ActorAddress, mpsc::UnboundedSender<SystemMessage>>>,
+    ) {
+        'outer: loop {
+            tokio::select! {
+                biased; // system channel checked first — PoisonPill takes priority
+                sys = self.system_receiver.recv() => {
+                    if matches!(sys, Some(SystemMessage::PoisonPill) | None) {
+                        break 'outer;
+                    }
+                }
+                msg = self.receiver.recv() => {
+                    let Some(m) = msg else { break 'outer };
+                    self.dispatch_one(m);
+                    if self.stop_requested.load(Ordering::Acquire) {
+                        break 'outer;
+                    }
+                    // Drain remaining messages without waiting (throughput batch)
+                    loop {
+                        if let Ok(SystemMessage::PoisonPill) = self.system_receiver.try_recv() {
+                            break 'outer;
+                        }
+                        match self.receiver.try_recv() {
+                            Ok(m) => {
+                                self.dispatch_one(m);
+                                if self.stop_requested.load(Ordering::Acquire) {
+                                    break 'outer;
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
-                    Err(_) => break,
                 }
-            }
-
-            // Rescheduling race-fix: clear scheduled BEFORE the final try_recv
-            // so concurrent tell()s that arrive in the window push to the queue
-            // themselves — closing the stuck-message race.
-            if !should_stop {
-                self.scheduled.store(false, Ordering::Release);
-                if let Ok(msg) = self.receiver.try_recv() {
-                    self.scheduled.store(true, Ordering::Release);
-                    self.dispatch_one(msg);
-                    if self.stop_requested.load(Ordering::Acquire) {
-                        should_stop = true;
-                    } else {
-                        self.work_queue.push(self.address.clone());
-                    }
-                }
-                // Err: truly empty — scheduled stays false
             }
         }
 
-        if should_stop {
-            RunResult::Stop
-        } else {
-            RunResult::Idle
-        }
-    }
-
-    fn do_post_stop(&mut self) {
         if let Err(e) = self.actor.post_stop(&self.context) {
             error!("Actor post_stop failed for {}: {}", self.address, e);
         }
-    }
-}
-
-// ------------------------------------------------------------------
-// Worker pool
-// ------------------------------------------------------------------
-
-struct WorkerPool {
-    shutdown: Arc<AtomicBool>,
-}
-
-impl WorkerPool {
-    fn new(
-        worker_count: usize,
-        actor_storage: Arc<DashMap<ActorAddress, Box<dyn ActorRunner>>>,
-        work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
-    ) -> Self {
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        for worker_id in 0..worker_count {
-            let storage = actor_storage.clone();
-            let queue = work_queue.clone();
-            let shutdown_signal = shutdown.clone();
-
-            tokio::spawn(async move {
-                Self::worker_loop(worker_id, storage, queue, shutdown_signal).await;
-            });
-        }
-
-        Self { shutdown }
-    }
-
-    async fn worker_loop(
-        worker_id: usize,
-        actor_storage: Arc<DashMap<ActorAddress, Box<dyn ActorRunner>>>,
-        work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
-        shutdown: Arc<AtomicBool>,
-    ) {
-        info!("Worker {} started", worker_id);
-        // TODO aktor-0sm: move to ActorSystemConfig::throughput
-        const BATCH_SIZE: usize = 10;
-
-        while !shutdown.load(Ordering::Relaxed) {
-            match work_queue.steal() {
-                crossbeam::deque::Steal::Success(address) => {
-                    let should_stop = {
-                        let guard = actor_storage.get_mut(&address);
-                        if let Some(mut runner) = guard {
-                            let stop = matches!(runner.run_batch(BATCH_SIZE), RunResult::Stop);
-                            if stop {
-                                runner.do_post_stop();
-                            }
-                            stop
-                        } else {
-                            false
-                        }
-                    }; // RefMut released before remove
-                    if should_stop {
-                        actor_storage.remove(&address);
-                        info!("Actor stopped: {}", address);
-                    }
-                }
-                crossbeam::deque::Steal::Empty => {
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
-                }
-                crossbeam::deque::Steal::Retry => {
-                    continue;
-                }
-            }
-        }
-
-        info!("Worker {} stopped", worker_id);
-    }
-
-    fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        actor_storage.remove(&self.address);
+        info!("Actor stopped: {}", self.address);
     }
 }
 
@@ -274,10 +173,8 @@ impl WorkerPool {
 pub struct ActorSystem {
     config: ActorSystemConfig,
     node_id: String,
-    worker_pool: Arc<RwLock<Option<WorkerPool>>>,
-    /// Type-erased per-actor state (actor + mailbox + context).
-    actor_storage: Arc<DashMap<ActorAddress, Box<dyn ActorRunner>>>,
-    work_queue: Arc<crossbeam::deque::Injector<ActorAddress>>,
+    /// System-channel senders keyed by address — used for shutdown and `contains_actor`.
+    actor_storage: Arc<DashMap<ActorAddress, mpsc::UnboundedSender<SystemMessage>>>,
     extensions: Arc<ExtensionRegistry>,
 }
 
@@ -531,27 +428,14 @@ impl ActorSystem {
         let node_id =
             std::env::var("NODE_ID").unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
 
-        let actor_storage: Arc<DashMap<ActorAddress, Box<dyn ActorRunner>>> =
-            Arc::new(DashMap::new());
-        let work_queue = Arc::new(crossbeam::deque::Injector::new());
-
         let system = Arc::new(Self {
-            config: config.clone(),
-            node_id,
-            worker_pool: Arc::new(RwLock::new(None)),
-            actor_storage: actor_storage.clone(),
-            work_queue: work_queue.clone(),
+            config,
+            node_id: node_id.clone(),
+            actor_storage: Arc::new(DashMap::new()),
             extensions: Arc::new(ExtensionRegistry::new()),
         });
 
-        let worker_count = config.thread_pool_size;
-        let worker_pool = WorkerPool::new(worker_count, actor_storage, work_queue);
-        *system.worker_pool.write().await = Some(worker_pool);
-
-        info!(
-            "Created actor system with node ID: {} and {} workers",
-            system.node_id, worker_count
-        );
+        info!("Created actor system with node ID: {}", node_id);
         Ok(system)
     }
 
@@ -597,10 +481,7 @@ impl ActorSystem {
         let (system_sender, system_receiver) = mpsc::unbounded_channel::<SystemMessage>();
 
         let mut actor_ref = ActorRef::new_local(address.clone(), sender);
-
-        let scheduled = Arc::new(AtomicBool::new(false));
-        actor_ref.set_scheduling(self.work_queue.clone(), scheduled.clone());
-        actor_ref.set_system_sender(system_sender);
+        actor_ref.set_system_sender(system_sender.clone());
 
         let stop_requested = Arc::new(AtomicBool::new(false));
 
@@ -619,18 +500,22 @@ impl ActorSystem {
             )));
         }
 
-        let runner = Box::new(ActorRunnerImpl {
+        // Register before spawning so contains_actor() is immediately true.
+        self.actor_storage.insert(address.clone(), system_sender);
+
+        let runner = ActorRunnerImpl {
             actor,
             context,
             receiver,
             system_receiver,
-            scheduled,
             stop_requested,
             address: address.clone(),
-            work_queue: self.work_queue.clone(),
-        }) as Box<dyn ActorRunner>;
+        };
 
-        self.actor_storage.insert(address.clone(), runner);
+        let actor_storage = self.actor_storage.clone();
+        tokio::spawn(async move {
+            runner.run(actor_storage).await;
+        });
 
         info!("Spawned actor: {}", address);
         Ok(actor_ref)
@@ -691,14 +576,23 @@ impl ActorSystem {
     pub async fn shutdown(self: Arc<Self>) -> Result<(), ActorError> {
         info!("Shutting down actor system");
 
-        if let Some(pool) = self.worker_pool.read().await.as_ref() {
-            pool.shutdown();
+        // Signal every live actor to stop.
+        for entry in self.actor_storage.iter() {
+            let _ = entry.value().send(SystemMessage::PoisonPill);
         }
 
-        for mut entry in self.actor_storage.iter_mut() {
-            entry.value_mut().do_post_stop();
+        // Wait for all actor tasks to self-remove (5 s timeout).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !self.actor_storage.is_empty() {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "Shutdown timeout — {} actors did not stop cleanly",
+                    self.actor_storage.len()
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        self.actor_storage.clear();
 
         info!("Actor system shutdown complete");
         Ok(())
