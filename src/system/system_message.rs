@@ -1,3 +1,5 @@
+use super::ActorAddress;
+
 /// System-level signals between actors, separate from user message channel.
 ///
 /// These travel through a dedicated system channel on every ActorRef so they
@@ -8,4 +10,7 @@
 pub enum SystemMessage {
     /// Instructs the actor to call post_stop and remove itself from the system.
     PoisonPill,
+    /// Sent by a stopping actor to its parent so the parent can remove the
+    /// child from its children map. Also the hook for future death-watch.
+    ActorStopped { address: ActorAddress },
 }

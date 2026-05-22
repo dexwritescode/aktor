@@ -123,30 +123,37 @@ impl<A: Actor> ActorRunnerImpl<A> {
         mut self,
         actor_storage: Arc<DashMap<ActorAddress, mpsc::UnboundedSender<SystemMessage>>>,
     ) {
-        'outer: loop {
+        'run: loop {
             tokio::select! {
                 biased; // system channel checked first — PoisonPill takes priority
                 sys = self.system_receiver.recv() => {
-                    if matches!(sys, Some(SystemMessage::PoisonPill) | None) {
-                        break 'outer;
+                    match sys {
+                        Some(SystemMessage::PoisonPill) | None => break 'run,
+                        Some(SystemMessage::ActorStopped { address }) => {
+                            self.context.remove_child_by_address(&address);
+                        }
                     }
                 }
                 msg = self.receiver.recv() => {
-                    let Some(m) = msg else { break 'outer };
+                    let Some(m) = msg else { break 'run };
                     self.dispatch_one(m);
                     if self.stop_requested.load(Ordering::Acquire) {
-                        break 'outer;
+                        break 'run;
                     }
                     // Drain remaining messages without waiting (throughput batch)
                     loop {
-                        if let Ok(SystemMessage::PoisonPill) = self.system_receiver.try_recv() {
-                            break 'outer;
+                        match self.system_receiver.try_recv() {
+                            Ok(SystemMessage::PoisonPill) => break 'run,
+                            Ok(SystemMessage::ActorStopped { address }) => {
+                                self.context.remove_child_by_address(&address);
+                            }
+                            Err(_) => {}
                         }
                         match self.receiver.try_recv() {
                             Ok(m) => {
                                 self.dispatch_one(m);
                                 if self.stop_requested.load(Ordering::Acquire) {
-                                    break 'outer;
+                                    break 'run;
                                 }
                             }
                             Err(_) => break,
@@ -160,6 +167,17 @@ impl<A: Actor> ActorRunnerImpl<A> {
             error!("Actor post_stop failed for {}: {}", self.address, e);
         }
         actor_storage.remove(&self.address);
+
+        // Notify parent so it can remove us from its children map.
+        // Parent may already be gone — that's fine, we just skip.
+        if let Some(parent_addr) = self.context.parent_address()
+            && let Some(parent_sender) = actor_storage.get(parent_addr)
+        {
+            let _ = parent_sender.send(SystemMessage::ActorStopped {
+                address: self.address.clone(),
+            });
+        }
+
         info!("Actor stopped: {}", self.address);
     }
 }
@@ -372,6 +390,20 @@ impl<M: Message> ActorContext<M> {
 
     pub fn props(&self) -> &ActorProps {
         &self.props
+    }
+
+    /// How many children this actor currently has. Useful for supervision introspection.
+    pub fn children_count(&self) -> usize {
+        self.children.lock().unwrap().len()
+    }
+
+    /// Remove a child from the children map by its full address.
+    /// Called by the runner when it receives ActorStopped for a child.
+    /// Private — only the runner in this module may call it.
+    fn remove_child_by_address(&self, address: &ActorAddress) {
+        if let Some(name) = address.name() {
+            self.children.lock().unwrap().remove(name);
+        }
     }
 
     /// Schedule a one-shot message delivery to `target` after `delay`.
@@ -1567,6 +1599,98 @@ mod tests {
             counter.load(AOrdering::Relaxed),
             2,
             "both ticks should have fired"
+        );
+    }
+
+    // A self-stopping child must be removed from the parent's children map,
+    // not just from actor_storage. Regression test for the memory leak where
+    // dead Box<dyn AnyActorRef> entries accumulated in the parent's children map.
+    #[tokio::test]
+    async fn test_self_stopping_child_removed_from_parent_children_map() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+
+        let reported_count = Arc::new(AtomicUsize::new(99)); // 99 = unreported sentinel
+
+        #[derive(Debug)]
+        struct ParentActor {
+            child: Option<ActorRef<TestMessage>>,
+            reported_count: Arc<AtomicUsize>,
+        }
+
+        impl Actor for ParentActor {
+            type Msg = TestMessage;
+
+            fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+                let child_ref = ctx.spawn_child("child", SelfStoppingActor, None)?;
+                self.child = Some(child_ref);
+                Ok(())
+            }
+
+            fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+                match msg.data.as_str() {
+                    "trigger" => {
+                        if let Some(child) = &self.child {
+                            let _ = child.tell(TestMessage { data: "go".into() }, None);
+                        }
+                    }
+                    "report" => {
+                        self.reported_count
+                            .store(ctx.children_count(), AOrdering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let parent_ref = system
+            .spawn_actor(
+                "parent",
+                ParentActor {
+                    child: None,
+                    reported_count: reported_count.clone(),
+                },
+                ActorProps::default(),
+            )
+            .unwrap();
+
+        let child_addr = parent_ref.address().child("child").unwrap();
+
+        // Trigger stop_self() on the child via the parent.
+        parent_ref
+            .tell(
+                TestMessage {
+                    data: "trigger".into(),
+                },
+                None,
+            )
+            .unwrap();
+
+        // Wait for child to stop and ActorStopped to propagate to parent.
+        tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+        assert!(
+            !system.contains_actor(&child_addr),
+            "child must be removed from actor_storage after stop_self"
+        );
+
+        // Ask parent to report its current children count.
+        parent_ref
+            .tell(
+                TestMessage {
+                    data: "report".into(),
+                },
+                None,
+            )
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+
+        assert_eq!(
+            reported_count.load(AOrdering::Relaxed),
+            0,
+            "parent's children map must be empty after child self-stops (memory leak fix)"
         );
     }
 }
