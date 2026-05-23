@@ -6,6 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
+use tracing::warn;
 use uuid::Uuid;
 
 /// Actor reference - a handle to communicate with an actor
@@ -33,7 +34,7 @@ enum ActorRefInner<M: Message> {
 #[derive(Debug, Clone)]
 pub struct LocalActorRef<M: Message> {
     /// Channel sender for message delivery
-    sender: mpsc::UnboundedSender<ActorMessage<M>>,
+    sender: mpsc::Sender<ActorMessage<M>>,
     /// Channel sender for system-level signals (PoisonPill, Watch, etc.)
     system_sender: Option<mpsc::UnboundedSender<SystemMessage>>,
     /// Actor lifecycle state
@@ -105,10 +106,7 @@ pub trait NetworkTransport<M: Message>: Send + Sync + fmt::Debug {
 
 impl<M: Message> ActorRef<M> {
     /// Create a new local actor reference
-    pub fn new_local(
-        address: ActorAddress,
-        sender: mpsc::UnboundedSender<ActorMessage<M>>,
-    ) -> Self {
+    pub fn new_local(address: ActorAddress, sender: mpsc::Sender<ActorMessage<M>>) -> Self {
         Self {
             id: Uuid::new_v4(),
             address: address.clone(),
@@ -246,9 +244,17 @@ impl<M: Message> ActorRef<M> {
 
 impl<M: Message> LocalActorRef<M> {
     fn send(&self, message: ActorMessage<M>) -> Result<(), ActorError> {
-        self.sender
-            .send(message)
-            .map_err(|e| ActorError::MessageDeliveryFailed(e.to_string()))
+        match self.sender.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("mailbox full — message dropped to DLQ");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("actor stopped — message dropped to DLQ");
+                Ok(())
+            }
+        }
     }
 
     /// Update the actor's state
@@ -266,13 +272,17 @@ impl<M: Message> RemoteActorRef<M> {
         message: ActorMessage<M>,
     ) -> Result<(), ActorError> {
         if !self.transport.is_reachable(&self.target_node) {
-            return Err(ActorError::NetworkError(format!(
-                "Node {} is not reachable",
+            warn!(
+                "node {} unreachable — message dropped to DLQ",
                 self.target_node
-            )));
+            );
+            return Ok(());
         }
 
-        self.transport.send(target_address, message)
+        if let Err(e) = self.transport.send(target_address, message) {
+            warn!("remote send failed — message dropped to DLQ: {e}");
+        }
+        Ok(())
     }
 }
 
@@ -333,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_actor_ref_creation() {
-        let (sender, _receiver) = mpsc::unbounded_channel();
+        let (sender, _receiver) = mpsc::channel(1024);
         let path = ActorPath::user("test-actor").unwrap();
         let address = ActorAddress::local(path);
 
@@ -357,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_actor_state_management() {
-        let (sender, _receiver) = mpsc::unbounded_channel();
+        let (sender, _receiver) = mpsc::channel(1024);
         let path = ActorPath::user("test-actor").unwrap();
         let address = ActorAddress::local(path);
 

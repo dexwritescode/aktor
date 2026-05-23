@@ -84,7 +84,7 @@ pub struct ActorContext<M: Message> {
 struct ActorRunnerImpl<A: Actor> {
     actor: A,
     context: Arc<ActorContext<A::Msg>>,
-    receiver: mpsc::UnboundedReceiver<crate::reference::ActorMessage<A::Msg>>,
+    receiver: mpsc::Receiver<crate::reference::ActorMessage<A::Msg>>,
     system_receiver: mpsc::UnboundedReceiver<SystemMessage>,
     stop_requested: Arc<AtomicBool>,
     address: ActorAddress,
@@ -509,7 +509,10 @@ impl ActorSystem {
             )));
         }
 
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let capacity = props
+            .mailbox_size
+            .unwrap_or(self.config.default_mailbox_size);
+        let (sender, receiver) = mpsc::channel(capacity);
         let (system_sender, system_receiver) = mpsc::unbounded_channel::<SystemMessage>();
 
         let mut actor_ref = ActorRef::new_local(address.clone(), sender);
@@ -823,7 +826,7 @@ mod tests {
             .with_supervision(SupervisionStrategy::Restart)
             .with_restart(5, 120);
 
-        assert_eq!(props.mailbox_size, 2000);
+        assert_eq!(props.mailbox_size, Some(2000));
         assert_eq!(props.dispatcher, Some("test-dispatcher".to_string()));
         assert_eq!(props.supervision_strategy, SupervisionStrategy::Restart);
         assert_eq!(props.max_restarts, 5);

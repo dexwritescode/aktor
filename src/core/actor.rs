@@ -118,8 +118,8 @@ pub struct ActorProps {
     pub max_restarts: u32,
     /// Time window for restart counting (in seconds)
     pub restart_window_secs: u64,
-    /// Mailbox size for this actor
-    pub mailbox_size: usize,
+    /// Mailbox capacity for this actor. None means use ActorSystemConfig::default_mailbox_size.
+    pub mailbox_size: Option<usize>,
     /// Dispatcher name for thread pool assignment
     pub dispatcher: Option<String>,
 }
@@ -130,7 +130,7 @@ impl ActorProps {
     }
 
     pub fn with_mailbox_size(mut self, size: usize) -> Self {
-        self.mailbox_size = size;
+        self.mailbox_size = Some(size);
         self
     }
 
@@ -159,7 +159,7 @@ impl Default for ActorProps {
             restart_on_failure: false,
             max_restarts: 3,
             restart_window_secs: 60,
-            mailbox_size: 1000,
+            mailbox_size: None,
             dispatcher: None,
         }
     }
