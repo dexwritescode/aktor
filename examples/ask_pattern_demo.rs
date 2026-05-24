@@ -1,33 +1,35 @@
+/// Demonstrates the ReplyTo<R> ask pattern.
+///
+/// The reply channel is embedded directly in the message variant — no context
+/// injection, no Box<dyn Any>, no runtime downcast.
 use aktor::*;
 use std::time::Duration;
 use tokio::time::sleep;
 
-// Example messages as specified in the implementation plan
-#[derive(Debug, Clone)]
-struct GetStatus;
+// ── Messages ──────────────────────────────────────────────────────────────────
 
-impl Message for GetStatus {
+#[derive(Debug)]
+enum StatusMsg {
+    /// Ask variant: caller receives a Status reply.
+    GetStatus { reply_to: ReplyTo<Status> },
+    /// Tell variant: fire-and-forget increment.
+    Increment,
+}
+
+impl Message for StatusMsg {
     fn type_id(&self) -> &'static str {
-        "GetStatus"
+        "StatusMsg"
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Status {
-    #[allow(dead_code)]
-    running: bool,
-    #[allow(dead_code)]
-    uptime: Duration,
     message_count: u64,
+    uptime: Duration,
 }
 
-impl Message for Status {
-    fn type_id(&self) -> &'static str {
-        "Status"
-    }
-}
+// ── Actor ─────────────────────────────────────────────────────────────────────
 
-// Example actor that can respond to ask pattern requests
 #[derive(Debug)]
 struct StatusActor {
     message_count: u64,
@@ -44,189 +46,121 @@ impl Default for StatusActor {
 }
 
 impl Actor for StatusActor {
-    type Msg = GetStatus;
+    type Msg = StatusMsg;
 
-    fn handle(&mut self, _msg: GetStatus, ctx: &ActorContext<GetStatus>) {
+    fn handle(&mut self, msg: StatusMsg, _ctx: &ActorContext<StatusMsg>) {
         self.message_count += 1;
-
-        if ctx.is_ask_request() {
-            // This is an ask request - send response
-            println!(
-                "StatusActor received ask request #{} (correlation: {:?})",
-                self.message_count,
-                ctx.correlation_id()
-            );
-
-            let status = Status {
-                running: true,
-                uptime: self.start_time.elapsed(),
-                message_count: self.message_count,
-            };
-
-            // Spawn task to send async response from sync handler
-            let ctx = ctx.clone();
-            tokio::spawn(async move {
-                let _ = ctx.respond(status).await;
-            });
-        } else {
-            // This is a tell message
-            println!("StatusActor received tell message #{}", self.message_count);
+        match msg {
+            StatusMsg::GetStatus { reply_to } => {
+                reply_to.reply(Status {
+                    message_count: self.message_count,
+                    uptime: self.start_time.elapsed(),
+                });
+            }
+            StatusMsg::Increment => {
+                // fire-and-forget — nothing to reply
+            }
         }
     }
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing for better debugging
     tracing_subscriber::fmt::init();
 
-    println!("=== Ask Pattern Demo ===");
+    println!("=== Ask Pattern Demo (ReplyTo<R>) ===\n");
 
-    // Create actor system
-    let config = ActorSystemConfig::default();
-    let system = ActorSystem::new(config).await?;
+    let system = ActorSystem::new(ActorSystemConfig::default()).await?;
+    let actor_ref = system.spawn_actor("status", StatusActor::default(), ActorProps::default())?;
+    sleep(Duration::from_millis(50)).await;
 
-    // Spawn status actor
-    let status_actor = StatusActor::default();
-    let actor_ref = system.spawn_actor("status-actor", status_actor, ActorProps::default())?;
+    // 1. Basic ask via ActorRef::ask
+    println!("1. Basic ask via actor_ref.ask(...):");
+    let status = actor_ref
+        .ask(
+            |rt| StatusMsg::GetStatus { reply_to: rt },
+            Duration::from_secs(1),
+        )
+        .await?;
+    println!("   ✅ count={}, uptime={:?}", status.message_count, status.uptime);
 
-    // Give the actor time to start
-    sleep(Duration::from_millis(100)).await;
+    // 2. Ask via free function
+    println!("\n2. Ask via ask() free function:");
+    let status: Status = ask(
+        &actor_ref,
+        |rt| StatusMsg::GetStatus { reply_to: rt },
+        Duration::from_secs(1),
+    )
+    .await?;
+    println!("   ✅ count={}", status.message_count);
 
-    println!("\n1. Basic Ask Pattern Example (from implementation plan):");
+    // 3. Tell still works alongside ask
+    println!("\n3. Tell (fire-and-forget):");
+    actor_ref.tell(StatusMsg::Increment, None)?;
+    actor_ref.tell(StatusMsg::Increment, None)?;
+    sleep(Duration::from_millis(20)).await;
+    let status = actor_ref
+        .ask(
+            |rt| StatusMsg::GetStatus { reply_to: rt },
+            Duration::from_secs(1),
+        )
+        .await?;
+    println!("   ✅ count after 2 increments + ask = {}", status.message_count);
 
-    // Example 1: Basic ask pattern as shown in the plan
-    let message = GetStatus;
-    let future =
-        ask_with_actor_ref::<GetStatus, Status>(&actor_ref, message, Duration::from_secs(5));
-
-    match future.await {
-        Ok(response) => {
-            println!("✅ Received response: {:?}", response);
-        }
-        Err(e) => {
-            println!("❌ Ask failed: {:?}", e);
-        }
-    }
-
-    println!("\n2. Using ActorRef.ask method:");
-
-    // Example 2: Using the ask method directly on ActorRef
-    let message = GetStatus;
-    let result: Result<Status, AskError> = actor_ref.ask(message, Duration::from_secs(5)).await;
-
-    match result {
-        Ok(response) => {
-            println!("✅ Direct ask response: {:?}", response);
-        }
-        Err(e) => {
-            println!("❌ Direct ask failed: {:?}", e);
-        }
-    }
-
-    println!("\n3. Using Extension Trait:");
-
-    // Example 3: Using the extension trait
-    use aktor::AskExt;
-    let message = GetStatus;
-    let future = actor_ref.ask_ext::<Status>(message, Duration::from_secs(5));
-
-    match future.await {
-        Ok(response) => {
-            println!("✅ Extension trait response: {:?}", response);
-        }
-        Err(e) => {
-            println!("❌ Extension trait ask failed: {:?}", e);
-        }
-    }
-
-    println!("\n4. Ask with Default Timeout:");
-
-    // Example 4: Using default timeout (5 seconds)
-    let message = GetStatus;
-    let future = actor_ref.ask_default::<Status>(message);
-
-    match future.await {
-        Ok(response) => {
-            println!("✅ Default timeout response: {:?}", response);
-        }
-        Err(e) => {
-            println!("❌ Default timeout ask failed: {:?}", e);
-        }
-    }
-
-    println!("\n5. Timeout Example:");
-
-    // Example 5: Demonstrating timeout behavior
-    let message = GetStatus;
-    let result: Result<Status, AskError> = actor_ref.ask(message, Duration::from_millis(1)).await;
-
-    match result {
-        Ok(response) => {
-            println!("✅ Fast response: {:?}", response);
-        }
-        Err(AskError::Timeout { timeout }) => {
-            println!("⏰ Ask timed out after {:?} (this is expected)", timeout);
-        }
-        Err(e) => {
-            println!("❌ Other error: {:?}", e);
-        }
-    }
-
-    println!("\n6. Multiple Concurrent Asks:");
-
-    // Example 6: Multiple concurrent ask requests
-    let futures = (0..3).map(|i| {
-        let actor_ref = actor_ref.clone();
-        tokio::spawn(async move {
-            let message = GetStatus;
-            let result: Result<Status, AskError> =
-                actor_ref.ask(message, Duration::from_secs(5)).await;
-            (i, result)
+    // 4. Concurrent asks
+    println!("\n4. 5 concurrent asks:");
+    let handles: Vec<_> = (0..5)
+        .map(|_| {
+            let r = actor_ref.clone();
+            tokio::spawn(async move {
+                r.ask(
+                    |rt| StatusMsg::GetStatus { reply_to: rt },
+                    Duration::from_secs(2),
+                )
+                .await
+            })
         })
-    });
-
-    for future in futures {
-        if let Ok((i, result)) = future.await {
-            match result {
-                Ok(response) => {
-                    println!(
-                        "✅ Concurrent ask #{}: message_count={}",
-                        i, response.message_count
-                    );
-                }
-                Err(e) => {
-                    println!("❌ Concurrent ask #{} failed: {:?}", i, e);
-                }
-            }
-        }
+        .collect();
+    for h in handles {
+        let s = h.await??;
+        println!("   ✅ count={}", s.message_count);
     }
 
-    println!("\n7. Tell vs Ask Comparison:");
-
-    // Example 7: Compare tell vs ask
-    println!("Sending tell message (fire-and-forget)...");
-    actor_ref.tell(GetStatus, None)?;
-
-    println!("Sending ask message (request-response)...");
-    let message = GetStatus;
-    match actor_ref
-        .ask::<Status>(message, Duration::from_secs(5))
+    // 5. Timeout
+    println!("\n5. Timeout demo (50 ms against a stopped actor):");
+    actor_ref.stop().await?;
+    sleep(Duration::from_millis(20)).await;
+    let system2 = ActorSystem::new(ActorSystemConfig::default()).await?;
+    // Spawn a dummy that never replies
+    #[derive(Debug, Default)]
+    struct SilentActor;
+    #[derive(Debug)]
+    enum SilentMsg {
+        Ping { reply_to: ReplyTo<u64> },
+    }
+    impl Message for SilentMsg {
+        fn type_id(&self) -> &'static str { "SilentMsg" }
+    }
+    impl Actor for SilentActor {
+        type Msg = SilentMsg;
+        fn handle(&mut self, _msg: SilentMsg, _ctx: &ActorContext<SilentMsg>) {
+            // intentionally no reply
+        }
+    }
+    let silent_ref = system2.spawn_actor("silent", SilentActor, ActorProps::default())?;
+    sleep(Duration::from_millis(10)).await;
+    match silent_ref
+        .ask(|rt| SilentMsg::Ping { reply_to: rt }, Duration::from_millis(50))
         .await
     {
-        Ok(response) => {
-            println!(
-                "✅ Ask response shows message count: {}",
-                response.message_count
-            );
+        Err(AskError::Timeout { timeout }) => {
+            println!("   ✅ Timed out after {:?} as expected", timeout);
         }
-        Err(e) => {
-            println!("❌ Ask failed: {:?}", e);
-        }
+        other => println!("   ❌ Unexpected result: {:?}", other),
     }
 
-    // Shutdown the system gracefully
-    system.shutdown().await?;
-
+    println!("\nDone.");
     Ok(())
 }

@@ -1,5 +1,5 @@
 use crate::core::{Actor, ActorError, ActorFactoryArgs, ActorProps, Message};
-use crate::reference::{ActorRef, ResponseEnvelope};
+use crate::reference::ActorRef;
 use crate::system::{
     ActorAddress, SystemMessage,
     extension::{Extension, ExtensionRegistry},
@@ -11,39 +11,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
-
-/// Response capability for ask pattern - embedded in context during ask handling
-pub(crate) struct ResponseCapability {
-    pub correlation_id: Uuid,
-    sender: mpsc::UnboundedSender<ResponseEnvelope>,
-}
-
-impl ResponseCapability {
-    pub(crate) fn new(
-        correlation_id: Uuid,
-        sender: mpsc::UnboundedSender<ResponseEnvelope>,
-    ) -> Self {
-        Self {
-            correlation_id,
-            sender,
-        }
-    }
-
-    pub(crate) async fn send_response<R: Message + 'static>(
-        &self,
-        response: R,
-    ) -> Result<(), ActorError> {
-        let envelope = ResponseEnvelope {
-            data: Box::new(response),
-            type_name: std::any::type_name::<R>(),
-            correlation_id: self.correlation_id,
-        };
-        self.sender.send(envelope).map_err(|_| {
-            ActorError::MessageDeliveryFailed("Response channel closed".to_string())
-        })?;
-        Ok(())
-    }
-}
 
 /// Type-erased handle used for the children map.
 /// Allows a parent actor to stop children regardless of their message type.
@@ -60,7 +27,6 @@ impl<M: Message> AnyActorRef for ActorRef<M> {
 /// Actor context provides the runtime environment for an actor.
 /// Parameterised on the message type `M`, not on the actor type, so it can be
 /// freely cloned and passed without the caller knowing the concrete actor type.
-#[derive(Clone)]
 pub struct ActorContext<M: Message> {
     pub actor_ref: ActorRef<M>,
     /// Reference to the non-generic actor system.
@@ -70,9 +36,23 @@ pub struct ActorContext<M: Message> {
     /// Parent actor address (if this is a child actor).
     parent: Option<ActorAddress>,
     props: ActorProps,
-    response_capability: Option<Arc<ResponseCapability>>,
     /// Set by stop_self() to signal the worker loop to tear down this actor.
     stop_requested: Arc<AtomicBool>,
+}
+
+// Manual Clone — derive would add a spurious `M: Clone` bound even though
+// we only clone Arcs and an ActorRef, never an `M` value itself.
+impl<M: Message> Clone for ActorContext<M> {
+    fn clone(&self) -> Self {
+        Self {
+            actor_ref: self.actor_ref.clone(),
+            system: self.system.clone(),
+            children: self.children.clone(),
+            parent: self.parent.clone(),
+            props: self.props.clone(),
+            stop_requested: self.stop_requested.clone(),
+        }
+    }
 }
 
 // ------------------------------------------------------------------
@@ -96,25 +76,6 @@ impl<A: Actor> ActorRunnerImpl<A> {
         match msg {
             crate::reference::ActorMessage::Tell { message, sender: _ } => {
                 self.actor.handle(message, &ctx);
-            }
-            crate::reference::ActorMessage::Ask {
-                request,
-                message_id: _,
-                timestamp: _,
-            } => {
-                let ask_ctx = ActorContext {
-                    actor_ref: ctx.actor_ref.clone(),
-                    system: ctx.system.clone(),
-                    children: ctx.children.clone(),
-                    parent: ctx.parent.clone(),
-                    props: ctx.props.clone(),
-                    response_capability: Some(Arc::new(ResponseCapability::new(
-                        request.correlation_id,
-                        request.response_to.sender,
-                    ))),
-                    stop_requested: ctx.stop_requested.clone(),
-                };
-                self.actor.handle(request.message, &ask_ctx);
             }
         }
     }
@@ -238,32 +199,8 @@ impl<M: Message> ActorContext<M> {
             children: Arc::new(Mutex::new(HashMap::new())),
             parent,
             props,
-            response_capability: None,
             stop_requested,
         }
-    }
-
-    /// Send a response back (only works during ask handling).
-    pub async fn respond<R: Message + 'static>(&self, response: R) -> Result<(), ActorError> {
-        if let Some(capability) = &self.response_capability {
-            capability.as_ref().send_response(response).await
-        } else {
-            Err(ActorError::MessageDeliveryFailed(
-                "Cannot respond: not an ask request".to_string(),
-            ))
-        }
-    }
-
-    /// Returns true if this context is wrapping an ask request.
-    pub fn is_ask_request(&self) -> bool {
-        self.response_capability.is_some()
-    }
-
-    /// Get the correlation ID for the current ask request (if any).
-    pub fn correlation_id(&self) -> Option<Uuid> {
-        self.response_capability
-            .as_ref()
-            .map(|cap| cap.correlation_id)
     }
 
     /// Signal the worker loop to stop this actor after the current message returns.

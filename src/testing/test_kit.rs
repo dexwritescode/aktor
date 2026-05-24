@@ -425,7 +425,7 @@ struct TestProbeActor<M: Message> {
     message_type: std::marker::PhantomData<M>,
 }
 
-impl<M: Message + 'static> Actor for TestProbeActor<M> {
+impl<M: Message + Clone + 'static> Actor for TestProbeActor<M> {
     type Msg = TestMessage;
 
     fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {

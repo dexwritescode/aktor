@@ -101,7 +101,7 @@ async fn main() {
                 workers: workers.clone(),
                 cursor: 0,
             },
-            ActorProps::default(),
+            ActorProps::new().with_mailbox_size(N_MESSAGES as usize),
         )
         .unwrap();
 
