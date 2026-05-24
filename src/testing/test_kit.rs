@@ -250,7 +250,7 @@ impl ActorTestKit {
     }
 
     /// Create a test probe for capturing messages of type M
-    pub async fn create_test_probe<M: Message + 'static>(&self) -> Arc<TestProbe<M>> {
+    pub async fn create_test_probe<M: Message + Clone + 'static>(&self) -> Arc<TestProbe<M>> {
         let probe_id = Uuid::new_v4();
         let messages = Arc::new(Mutex::new(VecDeque::new()));
 
@@ -578,29 +578,35 @@ mod tests {
         }
     }
 
+    // EchoActor uses the ReplyTo<R> pattern — reply channel lives in the message.
+    #[derive(Debug)]
+    enum EchoActorMsg {
+        Ask {
+            content: EchoMessage,
+            reply_to: crate::ReplyTo<EchoMessage>,
+        },
+        Tell(EchoMessage),
+    }
+
+    impl Message for EchoActorMsg {
+        fn type_id(&self) -> &'static str {
+            "EchoActorMsg"
+        }
+    }
+
     #[derive(Debug)]
     struct EchoActor;
 
     impl Actor for EchoActor {
-        type Msg = TestMessage;
+        type Msg = EchoActorMsg;
 
-        fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
-            if let Some(echo_msg) = msg.extract::<EchoMessage>() {
-                if ctx.is_ask_request() {
-                    // For ask requests, respond with the message
-                    let ctx = ctx.clone();
-                    let echo_msg = echo_msg.clone();
-                    tokio::spawn(async move {
-                        let _ = ctx.respond(TestMessage::new(echo_msg)).await;
-                    });
-                } else {
-                    // For tell messages, we need to manually send to sender if available
-                    // This simulates echoing back to the sender
-                    // In a real test scenario, you might want to use ask pattern instead
-                    println!("EchoActor received tell message: {:?}", echo_msg);
-
-                    // For this test, let's simulate sending a message to the probe
-                    // This is a simplified approach - in real usage, you'd typically use ask pattern
+        fn handle(&mut self, msg: EchoActorMsg, _ctx: &ActorContext<EchoActorMsg>) {
+            match msg {
+                EchoActorMsg::Ask { content, reply_to } => {
+                    reply_to.reply(content);
+                }
+                EchoActorMsg::Tell(content) => {
+                    println!("EchoActor received tell message: {:?}", content);
                 }
             }
         }
@@ -674,24 +680,19 @@ mod tests {
             content: "ask test".to_string(),
         };
 
-        // Test ask pattern with echo actor
-        let response: Result<TestMessage, _> = echo
-            .ask(TestMessage::new(message.clone()), Duration::from_secs(1))
-            .await;
+        let response = echo
+            .ask(
+                |rt| EchoActorMsg::Ask {
+                    content: message.clone(),
+                    reply_to: rt,
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
 
-        match response {
-            Ok(response_msg) => {
-                if let Some(echo_response) = response_msg.extract::<EchoMessage>() {
-                    assert_eq!(echo_response.content, "ask test");
-                    println!("Ask pattern test successful: {:?}", echo_response);
-                } else {
-                    panic!("Expected EchoMessage in response");
-                }
-            }
-            Err(e) => {
-                panic!("Ask pattern failed: {:?}", e);
-            }
-        }
+        assert_eq!(response.content, "ask test");
+        println!("Ask pattern test successful: {:?}", response);
 
         test_kit.shutdown().await.unwrap();
     }
