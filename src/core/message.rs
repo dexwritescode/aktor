@@ -4,7 +4,7 @@ use thiserror::Error;
 /// Core trait that all messages must implement
 /// Messages must be Send + Sync for distributed actors
 /// and 'static for actor lifetime management
-pub trait Message: Send + Sync + Debug + Clone + 'static {
+pub trait Message: Send + Sync + Debug + 'static {
     /// Message type identifier for routing and serialization
     fn type_id(&self) -> &'static str;
 }

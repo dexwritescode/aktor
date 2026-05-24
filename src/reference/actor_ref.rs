@@ -1,4 +1,4 @@
-use crate::ask::AskRequest;
+use crate::reference::ask::{ReplyTo, ask as ask_fn};
 use crate::system::SystemMessage;
 use crate::{ActorAddress, ActorError, AskError, Message};
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 /// Actor reference - a handle to communicate with an actor
 /// This provides location transparency - the same interface for local and remote actors
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ActorRef<M: Message> {
     /// Unique identifier for this actor reference
     pub id: Uuid,
@@ -22,7 +22,7 @@ pub struct ActorRef<M: Message> {
 }
 
 /// Internal actor reference implementation
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ActorRefInner<M: Message> {
     /// Local actor reference with direct channel
     Local(LocalActorRef<M>),
@@ -31,7 +31,7 @@ enum ActorRefInner<M: Message> {
 }
 
 /// Local actor reference implementation
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LocalActorRef<M: Message> {
     /// Channel sender for message delivery
     sender: mpsc::Sender<ActorMessage<M>>,
@@ -42,7 +42,7 @@ pub struct LocalActorRef<M: Message> {
 }
 
 /// Remote actor reference implementation
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RemoteActorRef<M: Message> {
     /// Target node for the remote actor
     target_node: String,
@@ -65,28 +65,19 @@ pub enum ActorState {
     Failed(String),
 }
 
-/// Message envelope for actor communication
+/// Message envelope for actor communication.
+///
+/// Only `Tell` exists — ask-pattern reply channels are embedded in the message
+/// itself via [`ReplyTo<R>`](crate::ReplyTo), so the mailbox is always uniform.
 #[derive(Debug)]
 pub enum ActorMessage<M: Message> {
-    /// Regular tell message
+    /// Regular tell message (the only variant; also carries ask-style messages
+    /// when the message contains a [`ReplyTo`] field).
     Tell {
         /// The actual message
         message: M,
         /// Sender reference for replies
         sender: Option<ActorRef<M>>,
-        // /// Message ID for tracking
-        // message_id: Uuid,
-        // /// Timestamp when message was sent
-        // timestamp: std::time::SystemTime,
-    },
-    /// Ask pattern request message
-    Ask {
-        /// Ask request containing message and response channel
-        request: AskRequest<M>,
-        /// Message ID for tracking
-        message_id: Uuid,
-        /// Timestamp when message was sent
-        timestamp: std::time::SystemTime,
     },
 }
 
@@ -151,30 +142,23 @@ impl<M: Message> ActorRef<M> {
         }
     }
 
-    /// Send an ask request (internal method)
-    pub(crate) async fn tell_ask_request(&self, request: AskRequest<M>) -> Result<(), ActorError> {
-        let actor_message = ActorMessage::Ask {
-            request,
-            message_id: Uuid::new_v4(),
-            timestamp: std::time::SystemTime::now(),
-        };
-
-        match &self.inner {
-            ActorRefInner::Local(local_ref) => local_ref.send(actor_message),
-            ActorRefInner::Remote(remote_ref) => remote_ref.send(&self.address, actor_message),
-        }
-    }
-
-    /// Send a message and wait for a response (ask pattern)
-    pub async fn ask<R>(&self, message: M, timeout: Duration) -> Result<R, AskError>
+    /// Ask an actor a question and wait for a typed reply.
+    ///
+    /// `make_msg` receives a [`ReplyTo<R>`] and must embed it in the returned
+    /// message. The actor calls `reply_to.reply(value)` in its handler.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let count: u64 = actor_ref
+    ///     .ask(|rt| CounterMsg::GetCount { reply_to: rt }, Duration::from_secs(5))
+    ///     .await?;
+    /// ```
+    pub async fn ask<R, F>(&self, make_msg: F, timeout: Duration) -> Result<R, AskError>
     where
-        R: Message + 'static,
-        M: Message,
+        R: Send + 'static,
+        F: FnOnce(ReplyTo<R>) -> M,
     {
-        // We need a system reference to use the ask function
-        // For now, we'll create a placeholder implementation
-        // This will be properly integrated when we have access to the system
-        crate::ask::ask_with_actor_ref(self, message, timeout).await
+        ask_fn(self, make_msg, timeout).await
     }
 
     /// Check if this reference points to a local actor
@@ -283,6 +267,46 @@ impl<M: Message> RemoteActorRef<M> {
             warn!("remote send failed — message dropped to DLQ: {e}");
         }
         Ok(())
+    }
+}
+
+// Manual Clone impls — derive would add a spurious `M: Clone` bound even
+// though we only clone Arcs and channel senders, never an `M` value itself.
+impl<M: Message> Clone for ActorRef<M> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            address: self.address.clone(),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<M: Message> Clone for ActorRefInner<M> {
+    fn clone(&self) -> Self {
+        match self {
+            ActorRefInner::Local(l) => ActorRefInner::Local(l.clone()),
+            ActorRefInner::Remote(r) => ActorRefInner::Remote(r.clone()),
+        }
+    }
+}
+
+impl<M: Message> Clone for LocalActorRef<M> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            system_sender: self.system_sender.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl<M: Message> Clone for RemoteActorRef<M> {
+    fn clone(&self) -> Self {
+        Self {
+            target_node: self.target_node.clone(),
+            transport: self.transport.clone(),
+        }
     }
 }
 

@@ -5,4 +5,4 @@ pub mod ask;
 mod ask_integration_test;
 
 pub use actor_ref::*;
-pub use ask::*;
+pub use ask::{AskError, ReplyTo, ask};
