@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::{Actor, ActorContext, ActorProps, ActorSystem, ActorSystemConfig, Message};
     use crate::reference::ask::ReplyTo;
+    use crate::{Actor, ActorContext, ActorProps, ActorSystem, ActorSystemConfig, Message};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::sleep;
@@ -88,11 +88,10 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    async fn echo_system() -> (
-        Arc<crate::ActorSystem>,
-        crate::ActorRef<EchoMsg>,
-    ) {
-        let system = ActorSystem::new(ActorSystemConfig::default()).await.unwrap();
+    async fn echo_system() -> (Arc<crate::ActorSystem>, crate::ActorRef<EchoMsg>) {
+        let system = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
         let actor_ref = system
             .spawn_actor("echo", EchoActor::default(), ActorProps::default())
             .unwrap();
@@ -216,7 +215,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_timeout() {
-        let system = ActorSystem::new(ActorSystemConfig::default()).await.unwrap();
+        let system = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
         let actor_ref = system
             .spawn_actor("slow", SlowActor::default(), ActorProps::default())
             .unwrap();
@@ -242,7 +243,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_channel_closed_when_actor_stops() {
-        let system = ActorSystem::new(ActorSystemConfig::default()).await.unwrap();
+        let system = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
         let actor_ref = system
             .spawn_actor("doomed", SlowActor::default(), ActorProps::default())
             .unwrap();
@@ -250,10 +253,7 @@ mod tests {
 
         // Stop the actor while a query is in flight — reply_to is dropped,
         // the oneshot receiver gets a ChannelClosed error.
-        let ask_fut = actor_ref.ask(
-            |rt| SlowMsg::Query { reply_to: rt },
-            Duration::from_secs(5),
-        );
+        let ask_fut = actor_ref.ask(|rt| SlowMsg::Query { reply_to: rt }, Duration::from_secs(5));
         actor_ref.stop().await.unwrap();
 
         let result = ask_fut.await;

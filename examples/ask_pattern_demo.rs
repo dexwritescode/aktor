@@ -84,7 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_secs(1),
         )
         .await?;
-    println!("   ✅ count={}, uptime={:?}", status.message_count, status.uptime);
+    println!(
+        "   ✅ count={}, uptime={:?}",
+        status.message_count, status.uptime
+    );
 
     // 2. Ask via free function
     println!("\n2. Ask via ask() free function:");
@@ -107,7 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_secs(1),
         )
         .await?;
-    println!("   ✅ count after 2 increments + ask = {}", status.message_count);
+    println!(
+        "   ✅ count after 2 increments + ask = {}",
+        status.message_count
+    );
 
     // 4. Concurrent asks
     println!("\n4. 5 concurrent asks:");
@@ -141,7 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ping { reply_to: ReplyTo<u64> },
     }
     impl Message for SilentMsg {
-        fn type_id(&self) -> &'static str { "SilentMsg" }
+        fn type_id(&self) -> &'static str {
+            "SilentMsg"
+        }
     }
     impl Actor for SilentActor {
         type Msg = SilentMsg;
@@ -152,7 +160,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let silent_ref = system2.spawn_actor("silent", SilentActor, ActorProps::default())?;
     sleep(Duration::from_millis(10)).await;
     match silent_ref
-        .ask(|rt| SilentMsg::Ping { reply_to: rt }, Duration::from_millis(50))
+        .ask(
+            |rt| SilentMsg::Ping { reply_to: rt },
+            Duration::from_millis(50),
+        )
         .await
     {
         Err(AskError::Timeout { timeout }) => {

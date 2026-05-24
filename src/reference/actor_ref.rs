@@ -1,6 +1,6 @@
+use crate::reference::ask::{ReplyTo, ask as ask_fn};
 use crate::system::SystemMessage;
 use crate::{ActorAddress, ActorError, AskError, Message};
-use crate::reference::ask::{ReplyTo, ask as ask_fn};
 use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
