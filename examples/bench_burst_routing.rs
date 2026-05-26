@@ -13,7 +13,7 @@ use std::time::Instant;
 use tokio::sync::Notify;
 
 const N_WORKERS: usize = 20;
-const N_MESSAGES: u64 = 10_000;
+const N_MESSAGES: u64 = 500_000;
 
 #[derive(Debug, Clone)]
 enum Msg {
