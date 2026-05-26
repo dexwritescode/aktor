@@ -7,7 +7,8 @@
 //! use aktor::prelude::*;
 //! ```
 
-// Extensions
+// Extensions (only available with the `http` feature)
+#[cfg(feature = "http")]
 pub use crate::extensions::{AsyncHttpClientExtension, HttpClientExtension};
 
 // Core traits and types

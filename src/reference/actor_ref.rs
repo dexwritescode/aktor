@@ -381,14 +381,15 @@ impl<M: Message> fmt::Display for ActorRef<M> {
 // ------------------------------------------------------------------
 // Serde — serialise as "{address}#{incarnation_id}"
 //
-// `serde` is already a hard dependency (used by ActorAddress / ActorPath).
-// Only the address and incarnation_id cross the wire — the channel handles
-// (`routing`) are process-local and never serialised.
+// Only compiled when the `serde` feature is enabled. Serialisation is only
+// meaningful for remote actors (cross-process message routing); within a
+// single process the channel handles (`routing`) are never serialised.
 //
 // Deserialisation produces a ref with no routing — use `ActorRefResolver` to
 // turn the address back into a live ref after deserialising.
 // ------------------------------------------------------------------
 
+#[cfg(feature = "serde")]
 impl<M: Message> serde::Serialize for ActorRef<M> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         // Wire format: "<address>#<incarnation_id>"
@@ -396,6 +397,7 @@ impl<M: Message> serde::Serialize for ActorRef<M> {
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de, M: Message> serde::Deserialize<'de> for ActorRef<M> {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
@@ -557,5 +559,60 @@ mod tests {
         // Simulate runner exit: set alive = false.
         alive.store(false, Ordering::Release);
         assert!(!r.is_alive());
+    }
+
+    // ------------------------------------------------------------------
+    // Serde round-trip tests — only compiled with the `serde` feature
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "serde")]
+    mod serde_tests {
+        use super::*;
+
+        #[test]
+        fn test_actor_ref_serialize_format() {
+            let r = make_ref("worker");
+            let json = serde_json::to_string(&r).expect("serialise ActorRef");
+            // Wire format is "<address>#<incarnation_id>" as a JSON string
+            let raw: String = serde_json::from_str(&json).expect("parse as string");
+            assert!(
+                raw.contains("actor://localhost"),
+                "expected actor:// scheme in wire format, got: {raw}"
+            );
+            assert!(raw.contains('#'), "expected '#' separator, got: {raw}");
+        }
+
+        #[test]
+        fn test_actor_ref_deserialize_produces_unresolved_ref() {
+            let r = make_ref("worker");
+            let json = serde_json::to_string(&r).expect("serialise ActorRef");
+            let restored: ActorRef<TestMsg> =
+                serde_json::from_str(&json).expect("deserialise ActorRef");
+
+            // Addresses and incarnation IDs must match
+            assert_eq!(r.address(), restored.address());
+            assert_eq!(r.incarnation_id(), restored.incarnation_id());
+
+            // The restored ref must be remote/unresolved (no live channel)
+            assert!(
+                !restored.is_local(),
+                "deserialised ref should be Remote until resolved"
+            );
+        }
+
+        #[test]
+        fn test_actor_ref_remote_serde_round_trip() {
+            let path = ActorPath::user("remote-worker").unwrap();
+            let address = ActorAddress::new("node-42", path).unwrap();
+            let r: ActorRef<TestMsg> =
+                ActorRef::new_remote(address.clone(), Arc::new(DummyTransport));
+
+            let json = serde_json::to_string(&r).expect("serialise remote ActorRef");
+            let restored: ActorRef<TestMsg> =
+                serde_json::from_str(&json).expect("deserialise remote ActorRef");
+
+            assert_eq!(r.address(), restored.address());
+            assert_eq!(r.incarnation_id(), restored.incarnation_id());
+        }
     }
 }

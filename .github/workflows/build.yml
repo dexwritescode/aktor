@@ -31,11 +31,23 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build
+      - name: Build (default)
         run: cargo build --locked
 
-      - name: Clippy
+      - name: Build (serde)
+        run: cargo build --locked --features serde
+
+      - name: Build (http)
+        run: cargo build --locked --features http
+
+      - name: Build (serde + http)
+        run: cargo build --locked --features serde,http
+
+      - name: Clippy (default)
         run: cargo clippy --locked -- -D warnings
+
+      - name: Clippy (serde + http)
+        run: cargo clippy --locked --features serde,http -- -D warnings
 
       - name: Format check
         run: cargo fmt --check
