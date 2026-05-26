@@ -13,7 +13,7 @@ pub mod prelude;
 
 // Re-export commonly used items
 pub use core::*;
-pub use reference::{ActorRef, AskError, LocalActorRef, RemoteActorRef, ReplyTo, ask};
+pub use reference::{ActorRef, AskError, ReplyTo, ask};
 pub use system::*;
 
 #[cfg(feature = "test-util")]

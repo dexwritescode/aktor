@@ -17,7 +17,7 @@ pub use crate::core::{Actor, ActorError, ActorProps, Message};
 pub use crate::system::{ActorAddress, ActorContext, ActorPath, ActorSystem, ActorSystemConfig};
 
 // Reference types
-pub use crate::reference::{ActorRef, AskError, LocalActorRef, RemoteActorRef, ReplyTo, ask};
+pub use crate::reference::{ActorRef, AskError, ReplyTo, ask};
 
 // Testing utilities (when feature is enabled)
 #[cfg(feature = "test-util")]
