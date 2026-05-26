@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
@@ -8,7 +7,8 @@ use thiserror::Error;
 /// - actor://node1/user/crawler-manager
 /// - actor://localhost/system/deadletter
 /// - actor://cluster-node-007/user/crawler/url-123456
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ActorAddress {
     /// Node identifier where the actor resides
     pub node_id: String,
@@ -21,7 +21,8 @@ pub struct ActorAddress {
 /// - /user/crawler-manager
 /// - /system/deadletter
 /// - /user/crawler/url-123456
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ActorPath {
     /// Path segments (e.g., ["user", "crawler-manager"])
     pub segments: Vec<String>,
@@ -282,5 +283,51 @@ mod tests {
         let addr = ActorAddress::new("node1", path).unwrap();
         let child = addr.child("worker-1").unwrap();
         assert_eq!(child.to_string(), "actor://node1/user/crawler/worker-1");
+    }
+
+    #[cfg(feature = "serde")]
+    mod serde_tests {
+        use super::*;
+
+        #[test]
+        fn test_actor_path_serde_round_trip() {
+            let path = ActorPath::user("crawler-manager").unwrap();
+            let json = serde_json::to_string(&path).expect("serialise ActorPath");
+            let restored: ActorPath = serde_json::from_str(&json).expect("deserialise ActorPath");
+            assert_eq!(path, restored);
+        }
+
+        #[test]
+        fn test_actor_address_serde_round_trip() {
+            let path = ActorPath::user("crawler-manager").unwrap();
+            let addr = ActorAddress::new("node1", path).unwrap();
+            let json = serde_json::to_string(&addr).expect("serialise ActorAddress");
+            let restored: ActorAddress =
+                serde_json::from_str(&json).expect("deserialise ActorAddress");
+            assert_eq!(addr, restored);
+        }
+
+        #[test]
+        fn test_local_address_serde_round_trip() {
+            let addr = ActorAddress::local(ActorPath::system("deadletter").unwrap());
+            let json = serde_json::to_string(&addr).expect("serialise local ActorAddress");
+            let restored: ActorAddress =
+                serde_json::from_str(&json).expect("deserialise local ActorAddress");
+            assert_eq!(addr, restored);
+            assert!(restored.is_local());
+        }
+
+        #[test]
+        fn test_deep_path_serde_round_trip() {
+            let path = ActorPath::user("crawler")
+                .unwrap()
+                .child("worker-1")
+                .unwrap();
+            let addr = ActorAddress::new("cluster-node-007", path).unwrap();
+            let json = serde_json::to_string(&addr).expect("serialise deep ActorAddress");
+            let restored: ActorAddress =
+                serde_json::from_str(&json).expect("deserialise deep ActorAddress");
+            assert_eq!(addr, restored);
+        }
     }
 }
