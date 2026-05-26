@@ -17,7 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
 
     steps:
@@ -26,28 +27,43 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build (default)
-        run: cargo build --locked
-
-      - name: Build (serde)
-        run: cargo build --locked --features serde
-
-      - name: Build (http)
-        run: cargo build --locked --features http
-
-      - name: Build (serde + http)
-        run: cargo build --locked --features serde,http
-
-      - name: Clippy (default)
-        run: cargo clippy --locked -- -D warnings
-
-      - name: Clippy (serde + http)
-        run: cargo clippy --locked --features serde,http -- -D warnings
+          components: rustfmt
 
       - name: Format check
         run: cargo fmt --check
+
+  build:
+    name: Build & Clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            cargo-flags: ""
+          - name: serde
+            cargo-flags: --features serde
+          - name: http
+            cargo-flags: --features http
+          - name: serde,http
+            cargo-flags: --features serde,http
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Build
+        run: cargo build --locked ${{ matrix.cargo-flags }}
+
+      - name: Clippy
+        run: cargo clippy --locked ${{ matrix.cargo-flags }} -- -D warnings
