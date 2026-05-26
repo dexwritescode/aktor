@@ -1,5 +1,6 @@
 use crate::core::{Actor, ActorError, ActorFactoryArgs, ActorProps, Message};
 use crate::reference::ActorRef;
+use crate::reference::actor_ref::{ActorMessage, ActorState, AnyMailbox, Mailbox};
 use crate::system::{
     ActorAddress, SystemMessage,
     extension::{Extension, ExtensionRegistry},
@@ -8,7 +9,7 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -64,47 +65,59 @@ impl<M: Message> Clone for ActorContext<M> {
 struct ActorRunnerImpl<A: Actor> {
     actor: A,
     context: Arc<ActorContext<A::Msg>>,
-    receiver: mpsc::Receiver<crate::reference::ActorMessage<A::Msg>>,
+    receiver: mpsc::Receiver<ActorMessage<A::Msg>>,
     system_receiver: mpsc::UnboundedReceiver<SystemMessage>,
     stop_requested: Arc<AtomicBool>,
     address: ActorAddress,
+    /// Shared routing object — used for state transitions and the alive flag.
+    mailbox: Arc<Mailbox<A::Msg>>,
 }
 
 impl<A: Actor> ActorRunnerImpl<A> {
-    fn dispatch_one(&mut self, msg: crate::reference::ActorMessage<A::Msg>) {
+    fn dispatch_one(&mut self, msg: ActorMessage<A::Msg>) {
         let ctx = Arc::clone(&self.context);
         match msg {
-            crate::reference::ActorMessage::Tell { message, sender: _ } => {
+            ActorMessage::Tell { message, sender: _ } => {
                 self.actor.handle(message, &ctx);
             }
         }
     }
 
-    async fn run(
-        mut self,
-        actor_storage: Arc<DashMap<ActorAddress, mpsc::UnboundedSender<SystemMessage>>>,
-    ) {
+    async fn run(mut self, actor_storage: Arc<DashMap<ActorAddress, RegistryEntry>>) {
+        // Actor is now processing messages.
+        self.mailbox.update_state(ActorState::Running).await;
+
         'run: loop {
             tokio::select! {
                 biased; // system channel checked first — PoisonPill takes priority
                 sys = self.system_receiver.recv() => {
                     match sys {
-                        Some(SystemMessage::PoisonPill) | None => break 'run,
+                        Some(SystemMessage::PoisonPill) | None => {
+                            self.mailbox.update_state(ActorState::Stopping).await;
+                            break 'run;
+                        }
                         Some(SystemMessage::ActorStopped { address }) => {
                             self.context.remove_child_by_address(&address);
                         }
                     }
                 }
                 msg = self.receiver.recv() => {
-                    let Some(m) = msg else { break 'run };
+                    let Some(m) = msg else {
+                        self.mailbox.update_state(ActorState::Stopping).await;
+                        break 'run;
+                    };
                     self.dispatch_one(m);
                     if self.stop_requested.load(Ordering::Acquire) {
+                        self.mailbox.update_state(ActorState::Stopping).await;
                         break 'run;
                     }
                     // Drain remaining messages without waiting (throughput batch)
                     loop {
                         match self.system_receiver.try_recv() {
-                            Ok(SystemMessage::PoisonPill) => break 'run,
+                            Ok(SystemMessage::PoisonPill) => {
+                                self.mailbox.update_state(ActorState::Stopping).await;
+                                break 'run;
+                            }
                             Ok(SystemMessage::ActorStopped { address }) => {
                                 self.context.remove_child_by_address(&address);
                             }
@@ -114,6 +127,7 @@ impl<A: Actor> ActorRunnerImpl<A> {
                             Ok(m) => {
                                 self.dispatch_one(m);
                                 if self.stop_requested.load(Ordering::Acquire) {
+                                    self.mailbox.update_state(ActorState::Stopping).await;
                                     break 'run;
                                 }
                             }
@@ -127,14 +141,19 @@ impl<A: Actor> ActorRunnerImpl<A> {
         if let Err(e) = self.actor.post_stop(&self.context) {
             error!("Actor post_stop failed for {}: {}", self.address, e);
         }
+
+        // Mark as stopped and signal dead — must happen before deregistration so
+        // any concurrent is_alive() / state() call sees the final state.
+        self.mailbox.update_state(ActorState::Stopped).await;
+        self.mailbox.alive.store(false, Ordering::Release);
         actor_storage.remove(&self.address);
 
         // Notify parent so it can remove us from its children map.
         // Parent may already be gone — that's fine, we just skip.
         if let Some(parent_addr) = self.context.parent_address()
-            && let Some(parent_sender) = actor_storage.get(parent_addr)
+            && let Some(entry) = actor_storage.get(parent_addr)
         {
-            let _ = parent_sender.send(SystemMessage::ActorStopped {
+            let _ = entry.mailbox.send_system(SystemMessage::ActorStopped {
                 address: self.address.clone(),
             });
         }
@@ -147,13 +166,29 @@ impl<A: Actor> ActorRunnerImpl<A> {
 // Actor system
 // ------------------------------------------------------------------
 
+/// One registry slot per live actor.
+///
+/// Holding the mailbox in two forms lets us:
+/// - Use `mailbox` (type-erased) for system control without knowing `M`.
+/// - Use `typed` (stored as `dyn Any`) for a safe, zero-unsafe downcast back
+///   to `Arc<Mailbox<M>>` in [`ActorRefResolver`].
+///
+/// Both Arcs point to the **same heap allocation** — they just differ in the
+/// trait object vtable attached to them.
+pub(crate) struct RegistryEntry {
+    /// For system signals (PoisonPill, ActorStopped, is_alive, …).
+    pub(crate) mailbox: Arc<dyn AnyMailbox>,
+    /// For typed downcast in ActorRefResolver — `Arc::downcast::<Mailbox<M>>()`.
+    pub(crate) typed: Arc<dyn std::any::Any + Send + Sync>,
+}
+
 /// The actor system. No longer generic over a message type — actors with
 /// different `type Msg` can all coexist in the same system.
 pub struct ActorSystem {
     config: ActorSystemConfig,
     node_id: String,
-    /// System-channel senders keyed by address — used for shutdown and `contains_actor`.
-    actor_storage: Arc<DashMap<ActorAddress, mpsc::UnboundedSender<SystemMessage>>>,
+    /// Registry of all live actors. See [`RegistryEntry`].
+    actor_storage: Arc<DashMap<ActorAddress, RegistryEntry>>,
     extensions: Arc<ExtensionRegistry>,
 }
 
@@ -449,12 +484,19 @@ impl ActorSystem {
         let capacity = props
             .mailbox_size
             .unwrap_or(self.config.default_mailbox_size);
-        let (sender, receiver) = mpsc::channel(capacity);
-        let (system_sender, system_receiver) = mpsc::unbounded_channel::<SystemMessage>();
+        let (msg_tx, receiver) = mpsc::channel(capacity);
+        let (sys_tx, system_receiver) = mpsc::unbounded_channel::<SystemMessage>();
 
-        let mut actor_ref = ActorRef::new_local(address.clone(), sender);
-        actor_ref.set_system_sender(system_sender.clone());
+        // Single routing object — shared between the ActorRef and the registry.
+        let mailbox = Arc::new(Mailbox {
+            incarnation_id: Uuid::new_v4(),
+            msg_tx,
+            sys_tx,
+            state: Arc::new(RwLock::new(ActorState::Starting)),
+            alive: Arc::new(AtomicBool::new(true)),
+        });
 
+        let actor_ref = ActorRef::new_local(address.clone(), Arc::clone(&mailbox));
         let stop_requested = Arc::new(AtomicBool::new(false));
 
         let context = Arc::new(ActorContext::new(
@@ -473,7 +515,13 @@ impl ActorSystem {
         }
 
         // Register before spawning so contains_actor() is immediately true.
-        self.actor_storage.insert(address.clone(), system_sender);
+        self.actor_storage.insert(
+            address.clone(),
+            RegistryEntry {
+                mailbox: Arc::clone(&mailbox) as Arc<dyn AnyMailbox>,
+                typed: Arc::clone(&mailbox) as Arc<dyn std::any::Any + Send + Sync>,
+            },
+        );
 
         let runner = ActorRunnerImpl {
             actor,
@@ -482,6 +530,7 @@ impl ActorSystem {
             system_receiver,
             stop_requested,
             address: address.clone(),
+            mailbox,
         };
 
         let actor_storage = self.actor_storage.clone();
@@ -550,7 +599,7 @@ impl ActorSystem {
 
         // Signal every live actor to stop.
         for entry in self.actor_storage.iter() {
-            let _ = entry.value().send(SystemMessage::PoisonPill);
+            let _ = entry.value().mailbox.send_system(SystemMessage::PoisonPill);
         }
 
         // Wait for all actor tasks to self-remove (5 s timeout).
@@ -592,6 +641,15 @@ impl ActorSystem {
 
     pub fn get_or_create_extension<T: Extension>(&self) -> Arc<T> {
         self.extensions.get_or_create::<T>()
+    }
+
+    /// Returns an [`ActorRefResolver`] that can reconstruct typed [`ActorRef`]s
+    /// from serialised address strings.
+    ///
+    /// The resolver holds a shared view of the live actor registry — lookups
+    /// always reflect the current state of the system.
+    pub fn resolver(&self) -> crate::system::resolver::ActorRefResolver {
+        crate::system::resolver::ActorRefResolver::new(Arc::clone(&self.actor_storage))
     }
 }
 
