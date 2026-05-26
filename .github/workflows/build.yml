@@ -60,7 +60,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
+          shared-key: build
 
       - name: Build
         run: cargo build --locked ${{ matrix.cargo-flags }}
