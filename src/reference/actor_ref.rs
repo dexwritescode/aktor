@@ -274,6 +274,32 @@ impl<M: Message> ActorRef<M> {
         }
     }
 
+    /// Send a system-level signal to this actor's system channel.
+    ///
+    /// # Remote actors — NOT YET SUPPORTED
+    ///
+    /// Only the `Local` routing path is implemented. The `Remote` arm is an
+    /// explicit compile-time gap: we have no TCP transport yet, so there is
+    /// nothing to send over. When remoting lands (aktor-rmb / aktor-b9b) this
+    /// method — and every other `match self.routing` site on `ActorRef` — will
+    /// be revisited as part of the location-transparency refactor (aktor-jhs).
+    pub(crate) fn send_system(&self, msg: SystemMessage) -> Result<(), ActorError> {
+        match &self.routing {
+            ActorRouting::Local(mb) => mb.sys_tx.send(msg).map_err(|_| {
+                ActorError::MessageDeliveryFailed("System channel closed".to_string())
+            }),
+            // ----------------------------------------------------------------
+            // TODO(aktor-jhs): remote system messages are not implemented.
+            // This arm exists only to satisfy exhaustiveness. Once TCP transport
+            // exists, system signals (StopSelf, Watch, Unwatch, …) will be
+            // serialised and dispatched through the network layer here.
+            // ----------------------------------------------------------------
+            ActorRouting::Remote(_) => Err(ActorError::MessageDeliveryFailed(
+                "send_system on remote ActorRef is not yet implemented (aktor-jhs)".to_string(),
+            )),
+        }
+    }
+
     /// The actor's address (path identity).
     pub fn address(&self) -> &ActorAddress {
         &self.address

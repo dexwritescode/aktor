@@ -37,8 +37,6 @@ pub struct ActorContext<M: Message> {
     /// Parent actor address (if this is a child actor).
     parent: Option<ActorAddress>,
     props: ActorProps,
-    /// Set by stop_self() to signal the worker loop to tear down this actor.
-    stop_requested: Arc<AtomicBool>,
 }
 
 // Manual Clone — derive would add a spurious `M: Clone` bound even though
@@ -51,7 +49,6 @@ impl<M: Message> Clone for ActorContext<M> {
             children: self.children.clone(),
             parent: self.parent.clone(),
             props: self.props.clone(),
-            stop_requested: self.stop_requested.clone(),
         }
     }
 }
@@ -67,7 +64,6 @@ struct ActorRunnerImpl<A: Actor> {
     context: Arc<ActorContext<A::Msg>>,
     receiver: mpsc::Receiver<ActorMessage<A::Msg>>,
     system_receiver: mpsc::UnboundedReceiver<SystemMessage>,
-    stop_requested: Arc<AtomicBool>,
     address: ActorAddress,
     /// Shared routing object — used for state transitions and the alive flag.
     mailbox: Arc<Mailbox<A::Msg>>,
@@ -92,7 +88,9 @@ impl<A: Actor> ActorRunnerImpl<A> {
                 biased; // system channel checked first — PoisonPill takes priority
                 sys = self.system_receiver.recv() => {
                     match sys {
-                        Some(SystemMessage::PoisonPill) | None => {
+                        Some(SystemMessage::PoisonPill)
+                        | Some(SystemMessage::StopSelf)
+                        | None => {
                             self.mailbox.update_state(ActorState::Stopping).await;
                             break 'run;
                         }
@@ -107,14 +105,13 @@ impl<A: Actor> ActorRunnerImpl<A> {
                         break 'run;
                     };
                     self.dispatch_one(m);
-                    if self.stop_requested.load(Ordering::Acquire) {
-                        self.mailbox.update_state(ActorState::Stopping).await;
-                        break 'run;
-                    }
-                    // Drain remaining messages without waiting (throughput batch)
+                    // Drain remaining messages without waiting (throughput batch).
+                    // System channel is checked first each iteration so that
+                    // PoisonPill and StopSelf (sent by stop_self()) take priority
+                    // over pending user messages.
                     loop {
                         match self.system_receiver.try_recv() {
-                            Ok(SystemMessage::PoisonPill) => {
+                            Ok(SystemMessage::PoisonPill) | Ok(SystemMessage::StopSelf) => {
                                 self.mailbox.update_state(ActorState::Stopping).await;
                                 break 'run;
                             }
@@ -126,10 +123,6 @@ impl<A: Actor> ActorRunnerImpl<A> {
                         match self.receiver.try_recv() {
                             Ok(m) => {
                                 self.dispatch_one(m);
-                                if self.stop_requested.load(Ordering::Acquire) {
-                                    self.mailbox.update_state(ActorState::Stopping).await;
-                                    break 'run;
-                                }
                             }
                             Err(_) => break,
                         }
@@ -226,7 +219,6 @@ impl<M: Message> ActorContext<M> {
         system: Arc<ActorSystem>,
         parent: Option<ActorAddress>,
         props: ActorProps,
-        stop_requested: Arc<AtomicBool>,
     ) -> Self {
         Self {
             actor_ref,
@@ -234,13 +226,14 @@ impl<M: Message> ActorContext<M> {
             children: Arc::new(Mutex::new(HashMap::new())),
             parent,
             props,
-            stop_requested,
         }
     }
 
-    /// Signal the worker loop to stop this actor after the current message returns.
+    /// Signal the worker loop to stop this actor after the current message
+    /// is fully handled. The signal travels through the system channel so it
+    /// respects message ordering and carries no shared mutable state.
     pub fn stop_self(&self) {
-        self.stop_requested.store(true, Ordering::Release);
+        let _ = self.actor_ref.send_system(SystemMessage::StopSelf);
     }
 
     /// Spawn a future and deliver its result back to this actor's mailbox.
@@ -497,14 +490,12 @@ impl ActorSystem {
         });
 
         let actor_ref = ActorRef::new_local(address.clone(), Arc::clone(&mailbox));
-        let stop_requested = Arc::new(AtomicBool::new(false));
 
         let context = Arc::new(ActorContext::new(
             actor_ref.clone(),
             self.clone(),
             parent,
             props.clone(),
-            stop_requested.clone(),
         ));
 
         if let Err(e) = actor.pre_start(&context) {
@@ -528,7 +519,6 @@ impl ActorSystem {
             context,
             receiver,
             system_receiver,
-            stop_requested,
             address: address.clone(),
             mailbox,
         };
