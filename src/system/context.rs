@@ -1,4 +1,4 @@
-use crate::core::{Actor, ActorError, ActorFactoryArgs, ActorProps, Message};
+use crate::core::{Actor, ActorError, ActorProps, Message, SupervisionStrategy};
 use crate::reference::ActorRef;
 use crate::reference::actor_ref::{ActorMessage, ActorState, AnyMailbox, Mailbox};
 use crate::system::{
@@ -6,15 +6,42 @@ use crate::system::{
     extension::{Extension, ExtensionRegistry},
 };
 use dashmap::DashMap;
+use rand::Rng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Type-erased handle used for the children map.
-/// Allows a parent actor to stop children regardless of their message type.
+// ------------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------------
+
+fn extract_panic_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn compute_backoff(attempt: u32, props: &ActorProps) -> std::time::Duration {
+    let base = props.backoff_base_ms as f64;
+    let cap = props.backoff_max_ms as f64;
+    // base * 2^(attempt-1), capped
+    let exp = (base * 2f64.powi(attempt.saturating_sub(1) as i32)).min(cap);
+    let jitter = props.backoff_jitter * rand::thread_rng().gen_range(-1.0f64..=1.0);
+    let ms = (exp * (1.0 + jitter)).max(0.0) as u64;
+    std::time::Duration::from_millis(ms.min(props.backoff_max_ms))
+}
+
+// ------------------------------------------------------------------
+// AnyActorRef — type-erased handle stored in children map
+// ------------------------------------------------------------------
+
 pub(crate) trait AnyActorRef: Send + Sync {
     fn stop_now(&self) -> Result<(), ActorError>;
 }
@@ -25,22 +52,21 @@ impl<M: Message> AnyActorRef for ActorRef<M> {
     }
 }
 
+// ------------------------------------------------------------------
+// ActorContext<M>
+// ------------------------------------------------------------------
+
 /// Actor context provides the runtime environment for an actor.
 /// Parameterised on the message type `M`, not on the actor type, so it can be
 /// freely cloned and passed without the caller knowing the concrete actor type.
 pub struct ActorContext<M: Message> {
     pub actor_ref: ActorRef<M>,
-    /// Reference to the non-generic actor system.
     pub system: Arc<ActorSystem>,
-    /// Children spawned by this actor (type-erased for heterogeneous message types).
     children: Arc<Mutex<HashMap<String, Box<dyn AnyActorRef>>>>,
-    /// Parent actor address (if this is a child actor).
     parent: Option<ActorAddress>,
     props: ActorProps,
 }
 
-// Manual Clone — derive would add a spurious `M: Clone` bound even though
-// we only clone Arcs and an ActorRef, never an `M` value itself.
 impl<M: Message> Clone for ActorContext<M> {
     fn clone(&self) -> Self {
         Self {
@@ -52,166 +78,6 @@ impl<M: Message> Clone for ActorContext<M> {
         }
     }
 }
-
-// ------------------------------------------------------------------
-// Per-actor runner
-// ------------------------------------------------------------------
-
-/// Concrete typed runner — owns the actor, its context, and its mailboxes.
-/// Each actor gets its own tokio task that blocks on `recv().await`.
-struct ActorRunnerImpl<A: Actor> {
-    actor: A,
-    context: Arc<ActorContext<A::Msg>>,
-    receiver: mpsc::Receiver<ActorMessage<A::Msg>>,
-    system_receiver: mpsc::UnboundedReceiver<SystemMessage>,
-    address: ActorAddress,
-    /// Shared routing object — used for state transitions and the alive flag.
-    mailbox: Arc<Mailbox<A::Msg>>,
-}
-
-impl<A: Actor> ActorRunnerImpl<A> {
-    fn dispatch_one(&mut self, msg: ActorMessage<A::Msg>) {
-        let ctx = Arc::clone(&self.context);
-        match msg {
-            ActorMessage::Tell { message, sender: _ } => {
-                self.actor.handle(message, &ctx);
-            }
-        }
-    }
-
-    async fn run(mut self, actor_storage: Arc<DashMap<ActorAddress, RegistryEntry>>) {
-        // Actor is now processing messages.
-        self.mailbox.update_state(ActorState::Running).await;
-
-        'run: loop {
-            tokio::select! {
-                biased; // system channel checked first — PoisonPill takes priority
-                sys = self.system_receiver.recv() => {
-                    match sys {
-                        Some(SystemMessage::PoisonPill)
-                        | Some(SystemMessage::StopSelf)
-                        | None => {
-                            self.mailbox.update_state(ActorState::Stopping).await;
-                            break 'run;
-                        }
-                        Some(SystemMessage::ActorStopped { address }) => {
-                            self.context.remove_child_by_address(&address);
-                        }
-                    }
-                }
-                msg = self.receiver.recv() => {
-                    let Some(m) = msg else {
-                        self.mailbox.update_state(ActorState::Stopping).await;
-                        break 'run;
-                    };
-                    self.dispatch_one(m);
-                    // Drain remaining messages without waiting (throughput batch).
-                    // System channel is checked first each iteration so that
-                    // PoisonPill and StopSelf (sent by stop_self()) take priority
-                    // over pending user messages.
-                    loop {
-                        match self.system_receiver.try_recv() {
-                            Ok(SystemMessage::PoisonPill) | Ok(SystemMessage::StopSelf) => {
-                                self.mailbox.update_state(ActorState::Stopping).await;
-                                break 'run;
-                            }
-                            Ok(SystemMessage::ActorStopped { address }) => {
-                                self.context.remove_child_by_address(&address);
-                            }
-                            Err(_) => {}
-                        }
-                        match self.receiver.try_recv() {
-                            Ok(m) => {
-                                self.dispatch_one(m);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Err(e) = self.actor.post_stop(&self.context) {
-            error!("Actor post_stop failed for {}: {}", self.address, e);
-        }
-
-        // Mark as stopped and signal dead — must happen before deregistration so
-        // any concurrent is_alive() / state() call sees the final state.
-        self.mailbox.update_state(ActorState::Stopped).await;
-        self.mailbox.alive.store(false, Ordering::Release);
-        actor_storage.remove(&self.address);
-
-        // Notify parent so it can remove us from its children map.
-        // Parent may already be gone — that's fine, we just skip.
-        if let Some(parent_addr) = self.context.parent_address()
-            && let Some(entry) = actor_storage.get(parent_addr)
-        {
-            let _ = entry.mailbox.send_system(SystemMessage::ActorStopped {
-                address: self.address.clone(),
-            });
-        }
-
-        info!("Actor stopped: {}", self.address);
-    }
-}
-
-// ------------------------------------------------------------------
-// Actor system
-// ------------------------------------------------------------------
-
-/// One registry slot per live actor.
-///
-/// Holding the mailbox in two forms lets us:
-/// - Use `mailbox` (type-erased) for system control without knowing `M`.
-/// - Use `typed` (stored as `dyn Any`) for a safe, zero-unsafe downcast back
-///   to `Arc<Mailbox<M>>` in [`ActorRefResolver`].
-///
-/// Both Arcs point to the **same heap allocation** — they just differ in the
-/// trait object vtable attached to them.
-pub(crate) struct RegistryEntry {
-    /// For system signals (PoisonPill, ActorStopped, is_alive, …).
-    pub(crate) mailbox: Arc<dyn AnyMailbox>,
-    /// For typed downcast in ActorRefResolver — `Arc::downcast::<Mailbox<M>>()`.
-    pub(crate) typed: Arc<dyn std::any::Any + Send + Sync>,
-}
-
-/// The actor system. No longer generic over a message type — actors with
-/// different `type Msg` can all coexist in the same system.
-pub struct ActorSystem {
-    config: ActorSystemConfig,
-    node_id: String,
-    /// Registry of all live actors. See [`RegistryEntry`].
-    actor_storage: Arc<DashMap<ActorAddress, RegistryEntry>>,
-    extensions: Arc<ExtensionRegistry>,
-}
-
-/// Configuration for the actor system
-#[derive(Debug, Clone)]
-pub struct ActorSystemConfig {
-    pub max_actors: usize,
-    pub default_mailbox_size: usize,
-    pub distributed: bool,
-    pub bind_address: Option<String>,
-    pub seed_nodes: Vec<String>,
-    pub thread_pool_size: usize,
-}
-
-impl Default for ActorSystemConfig {
-    fn default() -> Self {
-        Self {
-            max_actors: 1_000_000,
-            default_mailbox_size: 1000,
-            distributed: false,
-            bind_address: None,
-            seed_nodes: Vec::new(),
-            thread_pool_size: 4,
-        }
-    }
-}
-
-// ------------------------------------------------------------------
-// ActorContext<M> impl
-// ------------------------------------------------------------------
 
 impl<M: Message> ActorContext<M> {
     pub fn new(
@@ -229,19 +95,12 @@ impl<M: Message> ActorContext<M> {
         }
     }
 
-    /// Signal the worker loop to stop this actor after the current message
-    /// is fully handled. The signal travels through the system channel so it
-    /// respects message ordering and carries no shared mutable state.
+    /// Signal the worker loop to stop this actor after the current message.
     pub fn stop_self(&self) {
         let _ = self.actor_ref.send_system(SystemMessage::StopSelf);
     }
 
-    /// Spawn a future and deliver its result back to this actor's mailbox.
-    ///
-    /// `handle` stays sync and returns immediately. The future runs on the
-    /// Tokio thread pool and the resolved `Ok(msg)` is sent as a normal tell.
-    /// `Err(e)` is logged and dropped — encode errors as message variants if
-    /// the actor needs to react to them.
+    /// Spawn a future and deliver its `Ok` result back to this actor's mailbox.
     pub fn pipe_to_self<F, E>(&self, future: F)
     where
         F: std::future::Future<Output = Result<M, E>> + Send + 'static,
@@ -270,14 +129,20 @@ impl<M: Message> ActorContext<M> {
         &self.system
     }
 
-    /// Spawn a child actor. The child can have any `Actor` type and message type.
-    /// Callable from both `pre_start` and `handle` — no `.await` needed.
-    pub fn spawn_child<A: Actor>(
+    /// Spawn a child actor using a factory closure.
+    ///
+    /// The factory is called once at spawn time and again on each supervised
+    /// restart so the child always starts with a clean instance.
+    pub fn spawn_child<A, F>(
         &self,
         name: &str,
-        actor: A,
+        factory: F,
         props: Option<ActorProps>,
-    ) -> Result<ActorRef<A::Msg>, ActorError> {
+    ) -> Result<ActorRef<A::Msg>, ActorError>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
         let props = props.unwrap_or_default();
 
         let child_address = self
@@ -290,7 +155,7 @@ impl<M: Message> ActorContext<M> {
 
         let child_ref =
             self.system
-                .spawn_actor_with_address(child_address, actor, props, parent_addr)?;
+                .spawn_actor_with_address(child_address, factory, props, parent_addr)?;
 
         self.children
             .lock()
@@ -323,27 +188,6 @@ impl<M: Message> ActorContext<M> {
     }
 
     /// Returns the parent actor's address, if this is a child actor.
-    ///
-    /// This is an address only — it cannot be used to send messages directly.
-    /// Parent and child may have different message types, so there is no
-    /// typed `ActorRef` to call `.tell()` on.
-    ///
-    /// **To send messages to the parent**, store the parent's `ActorRef<ParentMsg>`
-    /// in the child actor's own fields and pass it at construction:
-    ///
-    /// ```ignore
-    /// struct WorkerActor {
-    ///     parent: ActorRef<SupervisorMsg>,
-    /// }
-    /// impl Actor for WorkerActor {
-    ///     type Msg = WorkerMsg;
-    ///     fn handle(&mut self, msg: WorkerMsg, _ctx: &ActorContext<WorkerMsg>) {
-    ///         self.parent.tell(SupervisorMsg::Done, None).unwrap();
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// `parent_address()` is intended for supervision and death-watch only.
     pub fn parent_address(&self) -> Option<&ActorAddress> {
         self.parent.as_ref()
     }
@@ -357,24 +201,20 @@ impl<M: Message> ActorContext<M> {
         &self.props
     }
 
-    /// How many children this actor currently has. Useful for supervision introspection.
+    /// How many children this actor currently has.
     pub fn children_count(&self) -> usize {
         self.children.lock().unwrap().len()
     }
 
     /// Remove a child from the children map by its full address.
-    /// Called by the runner when it receives ActorStopped for a child.
-    /// Private — only the runner in this module may call it.
-    fn remove_child_by_address(&self, address: &ActorAddress) {
+    /// Called by the runner when it receives `ActorStopped` for a child.
+    pub(crate) fn remove_child_by_address(&self, address: &ActorAddress) {
         if let Some(name) = address.name() {
             self.children.lock().unwrap().remove(name);
         }
     }
 
     /// Schedule a one-shot message delivery to `target` after `delay`.
-    ///
-    /// Callable directly from `handle` — no `.await` needed. Internally
-    /// spawns a Tokio task and returns immediately, same shape as `pipe_to_self`.
     pub fn schedule_once(
         &self,
         delay: std::time::Duration,
@@ -384,54 +224,432 @@ impl<M: Message> ActorContext<M> {
         let target = target.clone();
         let sender = Some(self.actor_ref.clone());
         let task_id = Uuid::new_v4();
-
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             if let Err(e) = target.tell(message, sender) {
                 error!("Scheduled message delivery failed: {}", e);
             }
         });
-
         task_id
     }
 
     /// Schedule a one-shot message back to this actor's own mailbox after `delay`.
-    ///
-    /// The Akka `timers.startSingleTimer` equivalent — synchronous at the call site,
-    /// message arrives through the normal mailbox after the delay expires.
-    ///
-    /// ```ignore
-    /// fn handle(&mut self, msg: DomainMsg, ctx: &ActorContext<DomainMsg>) {
-    ///     match msg {
-    ///         DomainMsg::Queue(url) => {
-    ///             self.pending.push_back(url);
-    ///             ctx.schedule_to_self(self.crawl_delay, DomainMsg::Dispatch);
-    ///         }
-    ///         DomainMsg::Dispatch => { /* send next URL to crawler */ }
-    ///     }
-    /// }
-    /// ```
     pub fn schedule_to_self(&self, delay: std::time::Duration, message: M) -> Uuid {
         self.schedule_once(delay, &self.actor_ref.clone(), message)
     }
 }
 
 // ------------------------------------------------------------------
-// ActorSystem impl
+// ActorRunnerImpl — per-actor tokio task
 // ------------------------------------------------------------------
+
+struct ActorRunnerImpl<A: Actor> {
+    /// Current actor instance. Replaced on restart.
+    actor: A,
+    /// Factory used to produce a fresh instance on each restart.
+    factory: Box<dyn Fn() -> A + Send + Sync>,
+    context: Arc<ActorContext<A::Msg>>,
+    receiver: mpsc::Receiver<ActorMessage<A::Msg>>,
+    system_receiver: mpsc::UnboundedReceiver<SystemMessage>,
+    address: ActorAddress,
+    mailbox: Arc<Mailbox<A::Msg>>,
+}
+
+impl<A: Actor> ActorRunnerImpl<A> {
+    /// Dispatch a single message, catching any panic from `handle`.
+    fn dispatch_one(&mut self, msg: ActorMessage<A::Msg>) -> Result<(), ActorError> {
+        let ctx = Arc::clone(&self.context);
+        match msg {
+            ActorMessage::Tell { message, sender: _ } => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.actor.handle(message, &ctx);
+                }));
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(payload) => Err(ActorError::Panic(extract_panic_message(payload))),
+                }
+            }
+        }
+    }
+
+    /// Apply the parent's supervision strategy for a failed child.
+    /// Called from the system-message arm when `ChildFailed` arrives.
+    fn apply_child_supervision(
+        &mut self,
+        child: &ActorAddress,
+        error_str: &str,
+        actor_storage: &Arc<DashMap<ActorAddress, RegistryEntry>>,
+    ) {
+        // Reconstruct a best-effort error to pass to the hook.
+        let error = ActorError::ActorCreationFailed(error_str.to_string());
+        let strategy = self.actor.on_child_failed(child, &error, &self.context);
+
+        match strategy {
+            SupervisionStrategy::Stop => {
+                // Child already removed itself from the registry. Remove from
+                // this actor's children map so we don't hold a dead entry.
+                self.context.remove_child_by_address(child);
+                debug!("Child {} stopped per supervision strategy", child);
+            }
+            SupervisionStrategy::Restart => {
+                // TODO(aktor-j7f): restarting a child from the parent requires
+                // the parent to hold the child's factory closure. This is
+                // deferred — the child's own supervision_strategy already handles
+                // self-restart with backoff. Treating parent-level Restart as
+                // Stop until parent-owned child factories are implemented.
+                warn!(
+                    "Parent Restart for child {} not yet implemented — treating as Stop",
+                    child
+                );
+                self.context.remove_child_by_address(child);
+            }
+            SupervisionStrategy::Resume => {
+                // Child is already dead. Parent continues; child entry is removed.
+                self.context.remove_child_by_address(child);
+                debug!(
+                    "Child {} Resume requested but child is gone — removed",
+                    child
+                );
+            }
+            SupervisionStrategy::Escalate => {
+                // Propagate the failure up to this actor's own parent.
+                if let Some(parent_addr) = self.context.parent_address()
+                    && let Some(entry) = actor_storage.get(parent_addr)
+                {
+                    let _ = entry.mailbox.send_system(SystemMessage::ChildFailed {
+                        child: child.clone(),
+                        error: error_str.to_string(),
+                    });
+                }
+                self.context.remove_child_by_address(child);
+                debug!("Child {} failure escalated to grandparent", child);
+            }
+        }
+    }
+
+    async fn run(mut self, actor_storage: Arc<DashMap<ActorAddress, RegistryEntry>>) {
+        let props = self.context.props().clone();
+        let mut restart_count: u32 = 0;
+
+        // ── Lifecycle loop ────────────────────────────────────────────────────
+        //
+        // Each iteration is one actor incarnation. The FIRST iteration skips
+        // pre_start because spawn_actor_with_address already called it
+        // synchronously (so callers can detect startup failures immediately).
+        // Subsequent iterations (restarts) call factory() + pre_start here.
+        let mut is_restart = false;
+
+        'lifecycle: loop {
+            // ── Startup ───────────────────────────────────────────────────────
+            if is_restart {
+                self.mailbox.update_state(ActorState::Starting).await;
+                self.actor = (self.factory)();
+
+                let pre_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.actor.pre_start(&self.context)
+                }));
+                let startup_err = match pre_result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e),
+                    Err(payload) => Some(ActorError::Panic(extract_panic_message(payload))),
+                };
+
+                if let Some(err) = startup_err {
+                    error!(
+                        "Actor {} failed in pre_start on restart #{}: {}",
+                        self.address, restart_count, err
+                    );
+                    self.mailbox
+                        .update_state(ActorState::Failed(err.to_string()))
+                        .await;
+
+                    // No post_stop — we never reached Running.
+                    // Apply supervision directly.
+                    if !self
+                        .handle_failure(&err, &mut restart_count, &props, &actor_storage)
+                        .await
+                    {
+                        break 'lifecycle;
+                    }
+                    is_restart = true;
+                    continue 'lifecycle;
+                }
+            }
+
+            self.mailbox.update_state(ActorState::Running).await;
+            let started_at = std::time::Instant::now();
+
+            // ── Message loop ─────────────────────────────────────────────────
+            let failure: Option<ActorError> = 'run: loop {
+                tokio::select! {
+                    biased;
+                    sys = self.system_receiver.recv() => {
+                        match sys {
+                            Some(SystemMessage::PoisonPill)
+                            | Some(SystemMessage::StopSelf)
+                            | None => {
+                                self.mailbox.update_state(ActorState::Stopping).await;
+                                break 'run None;
+                            }
+                            Some(SystemMessage::ActorStopped { address }) => {
+                                self.context.remove_child_by_address(&address);
+                            }
+                            Some(SystemMessage::ChildFailed { child, error }) => {
+                                self.apply_child_supervision(&child, &error, &actor_storage);
+                            }
+                        }
+                    }
+                    msg = self.receiver.recv() => {
+                        let Some(m) = msg else {
+                            self.mailbox.update_state(ActorState::Stopping).await;
+                            break 'run None;
+                        };
+
+                        match self.dispatch_one(m) {
+                            Ok(()) => {}
+                            Err(e) if props.supervision_strategy == SupervisionStrategy::Resume => {
+                                warn!("Actor {} resuming after: {}", self.address, e);
+                            }
+                            Err(e) => {
+                                self.mailbox
+                                    .update_state(ActorState::Failed(e.to_string()))
+                                    .await;
+                                break 'run Some(e);
+                            }
+                        }
+
+                        // Batch drain — process remaining queued messages without
+                        // sleeping. System channel is checked first each round so
+                        // PoisonPill / StopSelf always take priority.
+                        'drain: loop {
+                            loop {
+                                match self.system_receiver.try_recv() {
+                                    Ok(SystemMessage::PoisonPill)
+                                    | Ok(SystemMessage::StopSelf) => {
+                                        self.mailbox
+                                            .update_state(ActorState::Stopping)
+                                            .await;
+                                        break 'run None;
+                                    }
+                                    Ok(SystemMessage::ActorStopped { address }) => {
+                                        self.context.remove_child_by_address(&address);
+                                    }
+                                    Ok(SystemMessage::ChildFailed { child, error }) => {
+                                        self.apply_child_supervision(
+                                            &child,
+                                            &error,
+                                            &actor_storage,
+                                        );
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
+                            match self.receiver.try_recv() {
+                                Ok(m) => {
+                                    match self.dispatch_one(m) {
+                                        Ok(()) => {}
+                                        Err(e) if props.supervision_strategy
+                                            == SupervisionStrategy::Resume =>
+                                        {
+                                            warn!(
+                                                "Actor {} resuming after: {}",
+                                                self.address, e
+                                            );
+                                        }
+                                        Err(e) => {
+                                            self.mailbox
+                                                .update_state(ActorState::Failed(e.to_string()))
+                                                .await;
+                                            break 'run Some(e);
+                                        }
+                                    }
+                                }
+                                Err(_) => break 'drain,
+                            }
+                        }
+                    }
+                }
+            };
+
+            // ── Post-stop ─────────────────────────────────────────────────────
+            if let Err(e) = self.actor.post_stop(&self.context) {
+                error!("Actor {} post_stop failed: {}", self.address, e);
+            }
+
+            // ── Recovery window ───────────────────────────────────────────────
+            // If the actor ran for longer than the window without crashing,
+            // reset the restart counter so infrequent failures don't exhaust it.
+            if started_at.elapsed().as_secs() >= props.restart_window_secs {
+                restart_count = 0;
+            }
+
+            // ── Lifecycle decision ────────────────────────────────────────────
+            let Some(error) = failure else {
+                // Graceful stop (PoisonPill / StopSelf / channel closed).
+                self.mailbox.update_state(ActorState::Stopped).await;
+                self.mailbox.alive.store(false, Ordering::Release);
+                actor_storage.remove(&self.address);
+
+                if let Some(parent_addr) = self.context.parent_address()
+                    && let Some(entry) = actor_storage.get(parent_addr)
+                {
+                    let _ = entry.mailbox.send_system(SystemMessage::ActorStopped {
+                        address: self.address.clone(),
+                    });
+                }
+
+                info!("Actor stopped: {}", self.address);
+                break 'lifecycle;
+            };
+
+            // Runtime failure — apply supervision.
+            if !self
+                .handle_failure(&error, &mut restart_count, &props, &actor_storage)
+                .await
+            {
+                break 'lifecycle;
+            }
+            is_restart = true;
+        }
+    }
+
+    /// Apply supervision for a runtime failure. Returns `true` if the actor
+    /// should restart (caller continues `'lifecycle`), `false` if it should stop.
+    async fn handle_failure(
+        &self,
+        error: &ActorError,
+        restart_count: &mut u32,
+        props: &ActorProps,
+        actor_storage: &Arc<DashMap<ActorAddress, RegistryEntry>>,
+    ) -> bool {
+        match &props.supervision_strategy {
+            SupervisionStrategy::Stop | SupervisionStrategy::Escalate => {
+                self.mailbox.alive.store(false, Ordering::Release);
+                actor_storage.remove(&self.address);
+
+                if let Some(parent_addr) = self.context.parent_address()
+                    && let Some(entry) = actor_storage.get(parent_addr)
+                {
+                    let _ = entry.mailbox.send_system(SystemMessage::ChildFailed {
+                        child: self.address.clone(),
+                        error: error.to_string(),
+                    });
+                }
+
+                info!(
+                    "Actor {} stopped after failure (strategy={:?}): {}",
+                    self.address, props.supervision_strategy, error
+                );
+                false // stop
+            }
+            SupervisionStrategy::Resume => {
+                // Panics during handle() are handled inline in the 'run loop
+                // (continue 'run without breaking). This branch is only reached
+                // for pre_start failures with a Resume strategy — odd but legal.
+                // Just go back to Running with the same instance.
+                warn!(
+                    "Actor {} resuming after failure (pre_start path): {}",
+                    self.address, error
+                );
+                true // restart (re-enters lifecycle loop, skips factory + pre_start on Resume)
+            }
+            SupervisionStrategy::Restart => {
+                if *restart_count >= props.max_restarts {
+                    error!(
+                        "Actor {} exhausted {} restart(s) — stopping",
+                        self.address, props.max_restarts
+                    );
+                    self.mailbox.alive.store(false, Ordering::Release);
+                    actor_storage.remove(&self.address);
+
+                    if let Some(parent_addr) = self.context.parent_address()
+                        && let Some(entry) = actor_storage.get(parent_addr)
+                    {
+                        let _ = entry.mailbox.send_system(SystemMessage::ChildFailed {
+                            child: self.address.clone(),
+                            error: format!(
+                                "exhausted {} restarts; last error: {}",
+                                props.max_restarts, error
+                            ),
+                        });
+                    }
+                    return false; // stop
+                }
+
+                *restart_count += 1;
+                let delay = compute_backoff(*restart_count, props);
+                self.mailbox
+                    .update_state(ActorState::BackingOff(*restart_count))
+                    .await;
+
+                info!(
+                    "Actor {} backing off {}ms before restart #{}/{}",
+                    self.address,
+                    delay.as_millis(),
+                    restart_count,
+                    props.max_restarts
+                );
+                tokio::time::sleep(delay).await;
+                true // restart
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Registry
+// ------------------------------------------------------------------
+
+pub(crate) struct RegistryEntry {
+    pub(crate) mailbox: Arc<dyn AnyMailbox>,
+    pub(crate) typed: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+// ------------------------------------------------------------------
+// ActorSystem
+// ------------------------------------------------------------------
+
+pub struct ActorSystem {
+    config: ActorSystemConfig,
+    node_id: String,
+    actor_storage: Arc<DashMap<ActorAddress, RegistryEntry>>,
+    extensions: Arc<ExtensionRegistry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorSystemConfig {
+    pub max_actors: usize,
+    pub default_mailbox_size: usize,
+    pub distributed: bool,
+    pub bind_address: Option<String>,
+    pub seed_nodes: Vec<String>,
+    pub thread_pool_size: usize,
+}
+
+impl Default for ActorSystemConfig {
+    fn default() -> Self {
+        Self {
+            max_actors: 1_000_000,
+            default_mailbox_size: 1000,
+            distributed: false,
+            bind_address: None,
+            seed_nodes: Vec::new(),
+            thread_pool_size: 4,
+        }
+    }
+}
 
 impl ActorSystem {
     pub async fn new(config: ActorSystemConfig) -> Result<Arc<Self>, ActorError> {
         let node_id =
             std::env::var("NODE_ID").unwrap_or_else(|_| format!("node-{}", Uuid::new_v4()));
-
         let system = Arc::new(Self {
             config,
             node_id: node_id.clone(),
             actor_storage: Arc::new(DashMap::new()),
             extensions: Arc::new(ExtensionRegistry::new()),
         });
-
         info!("Created actor system with node ID: {}", node_id);
         Ok(system)
     }
@@ -444,29 +662,43 @@ impl ActorSystem {
         &self.config
     }
 
-    /// Spawn an actor with an auto-generated address.
-    pub fn spawn_actor<A: Actor>(
+    /// Spawn an actor using a factory closure.
+    ///
+    /// The factory is called immediately to produce the initial actor instance,
+    /// and is stored in the runner for use on each supervised restart.
+    ///
+    /// ```ignore
+    /// let ref = system.spawn_actor("worker", || WorkerActor::new(db.clone()), props)?;
+    /// ```
+    pub fn spawn_actor<A, F>(
         self: &Arc<Self>,
         name: &str,
-        actor: A,
+        factory: F,
         props: ActorProps,
-    ) -> Result<ActorRef<A::Msg>, ActorError> {
+    ) -> Result<ActorRef<A::Msg>, ActorError>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
         let path = crate::system::ActorPath::user(name)
             .map_err(|e| ActorError::ActorCreationFailed(e.to_string()))?;
         let address = ActorAddress::new(&self.node_id, path)
             .map_err(|e| ActorError::ActorCreationFailed(e.to_string()))?;
-
-        self.spawn_actor_with_address(address, actor, props, None)
+        self.spawn_actor_with_address(address, factory, props, None)
     }
 
     /// Spawn an actor at a specific address with an optional parent address.
-    pub fn spawn_actor_with_address<A: Actor>(
+    pub fn spawn_actor_with_address<A, F>(
         self: &Arc<Self>,
         address: ActorAddress,
-        mut actor: A,
+        factory: F,
         props: ActorProps,
         parent: Option<ActorAddress>,
-    ) -> Result<ActorRef<A::Msg>, ActorError> {
+    ) -> Result<ActorRef<A::Msg>, ActorError>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
         if self.actor_storage.contains_key(&address) {
             return Err(ActorError::ActorCreationFailed(format!(
                 "Actor already exists at address: {}",
@@ -480,7 +712,6 @@ impl ActorSystem {
         let (msg_tx, receiver) = mpsc::channel(capacity);
         let (sys_tx, system_receiver) = mpsc::unbounded_channel::<SystemMessage>();
 
-        // Single routing object — shared between the ActorRef and the registry.
         let mailbox = Arc::new(Mailbox {
             incarnation_id: Uuid::new_v4(),
             msg_tx,
@@ -498,6 +729,9 @@ impl ActorSystem {
             props.clone(),
         ));
 
+        // Create initial instance and run pre_start synchronously so the caller
+        // can detect startup failures before spawn_actor returns.
+        let mut actor = factory();
         if let Err(e) = actor.pre_start(&context) {
             return Err(ActorError::ActorCreationFailed(format!(
                 "Actor pre_start failed: {}",
@@ -505,7 +739,6 @@ impl ActorSystem {
             )));
         }
 
-        // Register before spawning so contains_actor() is immediately true.
         self.actor_storage.insert(
             address.clone(),
             RegistryEntry {
@@ -516,6 +749,7 @@ impl ActorSystem {
 
         let runner = ActorRunnerImpl {
             actor,
+            factory: Box::new(factory),
             context,
             receiver,
             system_receiver,
@@ -537,21 +771,7 @@ impl ActorSystem {
         self: &Arc<Self>,
         name: &str,
     ) -> Result<ActorRef<A::Msg>, ActorError> {
-        self.spawn_actor(name, A::default(), ActorProps::default())
-    }
-
-    /// Spawn an actor using the `ActorFactoryArgs` trait.
-    pub fn actor_of_args<A, Args>(
-        self: &Arc<Self>,
-        name: &str,
-        args: Args,
-    ) -> Result<ActorRef<A::Msg>, ActorError>
-    where
-        A: ActorFactoryArgs<Args> + 'static,
-        Args: Send + 'static,
-    {
-        let actor = A::create_args(args);
-        self.spawn_actor(name, actor, ActorProps::default())
+        self.spawn_actor(name, A::default, ActorProps::default())
     }
 
     /// Spawn a `Default` actor with custom props.
@@ -560,39 +780,18 @@ impl ActorSystem {
         name: &str,
         props: ActorProps,
     ) -> Result<ActorRef<A::Msg>, ActorError> {
-        self.spawn_actor(name, A::default(), props)
+        self.spawn_actor(name, A::default, props)
     }
 
-    /// Spawn an actor with args and custom props.
-    pub fn actor_of_args_props<A, Args>(
-        self: &Arc<Self>,
-        name: &str,
-        args: Args,
-        props: ActorProps,
-    ) -> Result<ActorRef<A::Msg>, ActorError>
-    where
-        A: ActorFactoryArgs<Args> + 'static,
-        Args: Send + 'static,
-    {
-        let actor = A::create_args(args);
-        self.spawn_actor(name, actor, props)
-    }
-
-    /// Returns true if an actor at `address` is currently alive in the system.
     pub fn contains_actor(&self, address: &ActorAddress) -> bool {
         self.actor_storage.contains_key(address)
     }
 
-    /// Shut down the actor system gracefully.
     pub async fn shutdown(self: Arc<Self>) -> Result<(), ActorError> {
         info!("Shutting down actor system");
-
-        // Signal every live actor to stop.
         for entry in self.actor_storage.iter() {
             let _ = entry.value().mailbox.send_system(SystemMessage::PoisonPill);
         }
-
-        // Wait for all actor tasks to self-remove (5 s timeout).
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while !self.actor_storage.is_empty() {
             if tokio::time::Instant::now() >= deadline {
@@ -604,23 +803,14 @@ impl ActorSystem {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-
         info!("Actor system shutdown complete");
         Ok(())
     }
 
-    /// Register a shared extension (HTTP client, DB pool, etc.).
-    ///
-    /// # Panics
-    /// Panics if an extension of this type is already registered.
     pub fn register_extension<T: Extension>(&self, extension: T) {
         self.extensions.register(extension);
     }
 
-    /// Get a registered extension by type.
-    ///
-    /// # Panics
-    /// Panics if the extension is not registered.
     pub fn extension<T: Extension>(&self) -> Arc<T> {
         self.extensions.get::<T>()
     }
@@ -633,15 +823,14 @@ impl ActorSystem {
         self.extensions.get_or_create::<T>()
     }
 
-    /// Returns an [`ActorRefResolver`] that can reconstruct typed [`ActorRef`]s
-    /// from serialised address strings.
-    ///
-    /// The resolver holds a shared view of the live actor registry — lookups
-    /// always reflect the current state of the system.
     pub fn resolver(&self) -> crate::system::resolver::ActorRefResolver {
         crate::system::resolver::ActorRefResolver::new(Arc::clone(&self.actor_storage))
     }
 }
+
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -659,19 +848,10 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct TestActor {
         received_count: usize,
         received_messages: Vec<String>,
-    }
-
-    impl Default for TestActor {
-        fn default() -> Self {
-            Self {
-                received_count: 0,
-                received_messages: Vec::new(),
-            }
-        }
     }
 
     impl Actor for TestActor {
@@ -685,226 +865,115 @@ mod tests {
 
     #[tokio::test]
     async fn test_actor_system_creation() {
-        let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
         assert!(!system.node_id().is_empty());
     }
 
     #[tokio::test]
     async fn test_actor_spawning() {
-        let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
-
-        let actor = TestActor::default();
-        let props = ActorProps::default();
-
-        let actor_ref = system.spawn_actor("test-actor", actor, props).unwrap();
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let actor_ref = system
+            .spawn_actor("test-actor", TestActor::default, ActorProps::default())
+            .unwrap();
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("test-actor"));
     }
 
     #[tokio::test]
     async fn test_message_sending() {
-        let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
-
-        let actor = TestActor::default();
-        let props = ActorProps::default();
-
-        let actor_ref = system.spawn_actor("test-actor", actor, props).unwrap();
-
-        let message = TestMessage {
-            data: "Hello".to_string(),
-        };
-
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let actor_ref = system
+            .spawn_actor("test-actor", TestActor::default, ActorProps::default())
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let result = actor_ref.tell(message, None);
-        assert!(result.is_ok());
-    }
-
-    #[derive(Debug)]
-    struct ParameterizedActor {
-        name: String,
-        initial_value: i32,
-        messages: Vec<String>,
-    }
-
-    impl ActorFactoryArgs<(String, i32)> for ParameterizedActor {
-        fn create_args(args: (String, i32)) -> Self {
-            Self {
-                name: args.0,
-                initial_value: args.1,
-                messages: Vec::new(),
-            }
-        }
-    }
-
-    impl Actor for ParameterizedActor {
-        type Msg = TestMessage;
-
-        fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
-            self.messages.push(format!("{}: {}", self.name, msg.data));
-        }
+        assert!(
+            actor_ref
+                .tell(
+                    TestMessage {
+                        data: "Hello".into()
+                    },
+                    None
+                )
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn test_actor_of() {
-        let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
-
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
         let actor_ref = system.actor_of::<TestActor>("test-actor").unwrap();
-
         assert!(actor_ref.is_local());
         assert_eq!(actor_ref.address().name(), Some("test-actor"));
-
-        let message = TestMessage {
-            data: "factory test".to_string(),
-        };
-
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let result = actor_ref.tell(message, None);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_actor_of_args() {
-        let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
-
-        let args = ("worker".to_string(), 42);
-        let actor_ref = system
-            .actor_of_args::<ParameterizedActor, _>("param-actor", args)
-            .unwrap();
-
-        assert!(actor_ref.is_local());
-        assert_eq!(actor_ref.address().name(), Some("param-actor"));
-
-        let message = TestMessage {
-            data: "parameterized test".to_string(),
-        };
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let result = actor_ref.tell(message, None);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_actor_factory_traits() {
-        let factory = crate::DefaultActorFactory::<TestActor>::default();
-        let actor = factory.create_actor();
-        assert_eq!(actor.received_count, 0);
-
-        let actor = ParameterizedActor::create_args(("test".to_string(), 100));
-        assert_eq!(actor.name, "test");
-        assert_eq!(actor.initial_value, 100);
-        assert!(actor.messages.is_empty());
+        assert!(
+            actor_ref
+                .tell(
+                    TestMessage {
+                        data: "factory test".into()
+                    },
+                    None
+                )
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn test_props_builder() {
         use crate::SupervisionStrategy;
-
         let props = ActorProps::new()
             .with_mailbox_size(2000)
             .with_dispatcher("test-dispatcher")
             .with_supervision(SupervisionStrategy::Restart)
             .with_restart(5, 120);
-
         assert_eq!(props.mailbox_size, Some(2000));
         assert_eq!(props.dispatcher, Some("test-dispatcher".to_string()));
         assert_eq!(props.supervision_strategy, SupervisionStrategy::Restart);
         assert_eq!(props.max_restarts, 5);
         assert_eq!(props.restart_window_secs, 120);
-        assert!(props.restart_on_failure);
     }
 
     #[tokio::test]
     async fn test_actor_of_props() {
-        let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
-
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
         let props = ActorProps::new()
             .with_mailbox_size(5000)
             .with_dispatcher("custom-dispatcher");
-
         let actor_ref = system
             .actor_of_props::<TestActor>("props-actor", props)
             .unwrap();
-
         assert!(actor_ref.is_local());
-
-        let message = TestMessage {
-            data: "props test".to_string(),
-        };
-
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let result = actor_ref.tell(message, None);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_actor_of_args_props() {
-        let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
-
-        let args = ("custom-worker".to_string(), 999);
-        let props = ActorProps::new()
-            .with_mailbox_size(3000)
-            .with_supervision(crate::SupervisionStrategy::Restart);
-
-        let actor_ref = system
-            .actor_of_args_props::<ParameterizedActor, _>("args-props-actor", args, props)
-            .unwrap();
-
-        assert!(actor_ref.is_local());
-
-        let message = TestMessage {
-            data: "args props test".to_string(),
-        };
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let result = actor_ref.tell(message, None);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_multiple_actors_different_factories() {
-        let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
-
-        let default_actor = system.actor_of::<TestActor>("default").unwrap();
-        let param_actor = system
-            .actor_of_args::<ParameterizedActor, _>("parameterized", ("worker-1".to_string(), 10))
-            .unwrap();
-
-        assert!(default_actor.is_local());
-        assert!(param_actor.is_local());
-
-        let msg1 = TestMessage {
-            data: "msg1".to_string(),
-        };
-        let msg2 = TestMessage {
-            data: "msg2".to_string(),
-        };
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        assert!(default_actor.tell(msg1, None).is_ok());
-        assert!(param_actor.tell(msg2, None).is_ok());
+        assert!(
+            actor_ref
+                .tell(
+                    TestMessage {
+                        data: "props test".into()
+                    },
+                    None
+                )
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn test_actor_name_uniqueness() {
-        let config = ActorSystemConfig::default();
-        let system: Arc<ActorSystem> = ActorSystem::new(config).await.unwrap();
-
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
         let actor1 = system.actor_of::<TestActor>("unique-name").unwrap();
         assert!(actor1.is_local());
-
         let result = system.actor_of::<TestActor>("unique-name");
         assert!(result.is_err());
-
         if let Err(ActorError::ActorCreationFailed(msg)) = result {
             assert!(msg.contains("Actor already exists"));
         } else {
@@ -912,7 +981,6 @@ mod tests {
         }
     }
 
-    // Captures ctx.parent_address() during pre_start for test assertions.
     #[derive(Debug)]
     struct ParentProbeActor {
         captured: Arc<std::sync::Mutex<Option<String>>>,
@@ -920,9 +988,7 @@ mod tests {
 
     impl Actor for ParentProbeActor {
         type Msg = TestMessage;
-
         fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
-
         fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
             *self.captured.lock().unwrap() = ctx.parent_address().map(|a| a.to_string());
             Ok(())
@@ -934,18 +1000,17 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
         let captured = Arc::new(std::sync::Mutex::new(None::<String>));
+        let c = captured.clone();
         system
             .spawn_actor(
                 "root",
-                ParentProbeActor {
-                    captured: captured.clone(),
+                move || ParentProbeActor {
+                    captured: c.clone(),
                 },
                 ActorProps::default(),
             )
             .unwrap();
-
         assert!(captured.lock().unwrap().is_none());
     }
 
@@ -954,25 +1019,22 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
         let parent_ref = system
-            .spawn_actor("parent", TestActor::default(), ActorProps::default())
+            .spawn_actor("parent", TestActor::default, ActorProps::default())
             .unwrap();
-
         let captured = Arc::new(std::sync::Mutex::new(None::<String>));
+        let c = captured.clone();
         let child_address = parent_ref.address().child("child").unwrap();
         system
             .spawn_actor_with_address(
                 child_address,
-                ParentProbeActor {
-                    captured: captured.clone(),
+                move || ParentProbeActor {
+                    captured: c.clone(),
                 },
                 ActorProps::default(),
                 Some(parent_ref.address().clone()),
             )
             .unwrap();
-
-        // pre_start runs synchronously inside spawn_actor_with_address
         assert_eq!(
             *captured.lock().unwrap(),
             Some(parent_ref.address().to_string())
@@ -984,7 +1046,6 @@ mod tests {
 
     impl Actor for SelfStoppingActor {
         type Msg = TestMessage;
-
         fn handle(&mut self, _msg: TestMessage, ctx: &ActorContext<TestMessage>) {
             ctx.stop_self();
         }
@@ -995,20 +1056,20 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
         let actor_ref = system
-            .spawn_actor("self-stopper", SelfStoppingActor, ActorProps::default())
+            .spawn_actor(
+                "self-stopper",
+                SelfStoppingActor::default,
+                ActorProps::default(),
+            )
             .unwrap();
-
         actor_ref
             .tell(TestMessage { data: "go".into() }, None)
             .unwrap();
-
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
         assert!(
             !system.contains_actor(actor_ref.address()),
-            "actor should have been removed from the system after stop_self()"
+            "actor should have been removed after stop_self()"
         );
     }
 
@@ -1017,35 +1078,28 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
         let actor_ref = system
-            .spawn_actor("pill-target", TestActor::default(), ActorProps::default())
+            .spawn_actor("pill-target", TestActor::default, ActorProps::default())
             .unwrap();
-
         actor_ref.stop().await.unwrap();
-
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
         assert!(
             !system.contains_actor(actor_ref.address()),
-            "actor should have been removed from the system after PoisonPill"
+            "actor should have been removed after PoisonPill"
         );
     }
 
     #[tokio::test]
     async fn test_all_messages_delivered_across_batch_boundary() {
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
-
         let counter = Arc::new(AtomicUsize::new(0));
 
         #[derive(Debug)]
         struct CountingActor {
             counter: Arc<AtomicUsize>,
         }
-
         impl Actor for CountingActor {
             type Msg = TestMessage;
-
             fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
                 self.counter.fetch_add(1, AOrdering::Relaxed);
             }
@@ -1054,13 +1108,11 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
+        let c = counter.clone();
         let actor_ref = system
             .spawn_actor(
                 "counter",
-                CountingActor {
-                    counter: counter.clone(),
-                },
+                move || CountingActor { counter: c.clone() },
                 ActorProps::default(),
             )
             .unwrap();
@@ -1076,14 +1128,8 @@ mod tests {
                 )
                 .unwrap();
         }
-
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        assert_eq!(
-            counter.load(AOrdering::Relaxed),
-            MSG_COUNT,
-            "all messages must be delivered with no stuck messages"
-        );
+        assert_eq!(counter.load(AOrdering::Relaxed), MSG_COUNT);
     }
 
     #[derive(Debug)]
@@ -1093,11 +1139,9 @@ mod tests {
 
     impl Actor for PreStartChildActor {
         type Msg = TestMessage;
-
         fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
-
         fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
-            let child = ctx.spawn_child("child", TestActor::default(), None)?;
+            let child = ctx.spawn_child("child", TestActor::default, None)?;
             *self.child_address.lock().unwrap() = Some(child.address().to_string());
             Ok(())
         }
@@ -1108,19 +1152,17 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
         let child_addr = Arc::new(std::sync::Mutex::new(None::<String>));
-
+        let c = child_addr.clone();
         system
             .spawn_actor(
                 "pre-start-actor",
-                PreStartChildActor {
-                    child_address: child_addr.clone(),
+                move || PreStartChildActor {
+                    child_address: c.clone(),
                 },
                 ActorProps::default(),
             )
             .unwrap();
-
         assert!(
             child_addr.lock().unwrap().is_some(),
             "child spawned in pre_start must be registered before spawn_actor returns"
@@ -1134,7 +1176,6 @@ mod tests {
 
     impl Actor for PipeActor {
         type Msg = TestMessage;
-
         fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
             if msg.data == "start" {
                 self.phase.lock().unwrap().push("handle:start".into());
@@ -1155,19 +1196,15 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
         let phase = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-
+        let p = phase.clone();
         let actor_ref = system
             .spawn_actor(
                 "pipe-actor",
-                PipeActor {
-                    phase: phase.clone(),
-                },
+                move || PipeActor { phase: p.clone() },
                 ActorProps::default(),
             )
             .unwrap();
-
         actor_ref
             .tell(
                 TestMessage {
@@ -1176,54 +1213,42 @@ mod tests {
                 None,
             )
             .unwrap();
-
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
         let observed = phase.lock().unwrap().clone();
-        assert_eq!(
-            observed,
-            vec!["handle:start", "handle:piped"],
-            "handle must return after pipe_to_self, then piped result must arrive as a message"
-        );
+        assert_eq!(observed, vec!["handle:start", "handle:piped"]);
     }
 
     #[tokio::test]
     async fn test_pipe_to_self_err_is_dropped() {
-        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
-            .await
-            .unwrap();
-
-        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let received_clone = received.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        let received = Arc::new(AtomicUsize::new(0));
 
         #[derive(Debug)]
         struct CountActor {
-            count: Arc<std::sync::atomic::AtomicUsize>,
+            count: Arc<AtomicUsize>,
         }
-
         impl Actor for CountActor {
             type Msg = TestMessage;
-
             fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 if msg.data == "start" {
                     ctx.pipe_to_self(async { Err::<TestMessage, &str>("simulated failure") });
                 } else {
-                    self.count
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.count.fetch_add(1, AOrdering::Relaxed);
                 }
             }
         }
 
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let r = received.clone();
         let actor_ref = system
             .spawn_actor(
                 "err-pipe-actor",
-                CountActor {
-                    count: received_clone,
-                },
+                move || CountActor { count: r.clone() },
                 ActorProps::default(),
             )
             .unwrap();
-
         actor_ref
             .tell(
                 TestMessage {
@@ -1232,22 +1257,12 @@ mod tests {
                 None,
             )
             .unwrap();
-
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        assert_eq!(
-            received.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "Err from pipe_to_self must not deliver a message"
-        );
+        assert_eq!(received.load(AOrdering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn test_pipe_to_self_does_not_block_subsequent_messages() {
-        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
-            .await
-            .unwrap();
-
         let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let gate = Arc::new(tokio::sync::Notify::new());
 
@@ -1256,10 +1271,8 @@ mod tests {
             log: Arc<std::sync::Mutex<Vec<String>>>,
             gate: Arc<tokio::sync::Notify>,
         }
-
         impl Actor for InterleavingActor {
             type Msg = TestMessage;
-
             fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 if msg.data == "pipe" {
                     self.log.lock().unwrap().push("pipe".into());
@@ -1276,106 +1289,57 @@ mod tests {
             }
         }
 
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let l = log.clone();
+        let g = gate.clone();
         let actor_ref = system
             .spawn_actor(
                 "interleave-actor",
-                InterleavingActor {
-                    log: log.clone(),
-                    gate: gate.clone(),
+                move || InterleavingActor {
+                    log: l.clone(),
+                    gate: g.clone(),
                 },
                 ActorProps::default(),
             )
             .unwrap();
 
-        actor_ref
-            .tell(
-                TestMessage {
-                    data: "msg-a".into(),
-                },
-                None,
-            )
-            .unwrap();
-        actor_ref
-            .tell(
-                TestMessage {
-                    data: "pipe".into(),
-                },
-                None,
-            )
-            .unwrap();
-        actor_ref
-            .tell(
-                TestMessage {
-                    data: "msg-b".into(),
-                },
-                None,
-            )
-            .unwrap();
-        actor_ref
-            .tell(
-                TestMessage {
-                    data: "msg-c".into(),
-                },
-                None,
-            )
-            .unwrap();
-
+        for data in ["msg-a", "pipe", "msg-b", "msg-c"] {
+            actor_ref
+                .tell(TestMessage { data: data.into() }, None)
+                .unwrap();
+        }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
         {
             let observed = log.lock().unwrap().clone();
-            assert!(
-                observed.contains(&"msg-b".to_string()),
-                "msg-b must be processed while future is in-flight"
-            );
-            assert!(
-                observed.contains(&"msg-c".to_string()),
-                "msg-c must be processed while future is in-flight"
-            );
-            assert!(
-                !observed.contains(&"piped".to_string()),
-                "piped must not arrive before gate is opened, got: {:?}",
-                observed
-            );
+            assert!(observed.contains(&"msg-b".to_string()));
+            assert!(observed.contains(&"msg-c".to_string()));
+            assert!(!observed.contains(&"piped".to_string()));
         }
-
         gate.notify_one();
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-
         let observed = log.lock().unwrap().clone();
-        assert!(
-            observed.contains(&"piped".to_string()),
-            "piped must arrive after gate opens"
-        );
-        let msg_b_pos = observed.iter().position(|s| s == "msg-b").unwrap();
-        let msg_c_pos = observed.iter().position(|s| s == "msg-c").unwrap();
-        let piped_pos = observed.iter().position(|s| s == "piped").unwrap();
-        assert!(
-            piped_pos > msg_b_pos && piped_pos > msg_c_pos,
-            "piped must appear after msg-b and msg-c, got: {:?}",
-            observed
-        );
+        assert!(observed.contains(&"piped".to_string()));
+        let b = observed.iter().position(|s| s == "msg-b").unwrap();
+        let c = observed.iter().position(|s| s == "msg-c").unwrap();
+        let p = observed.iter().position(|s| s == "piped").unwrap();
+        assert!(p > b && p > c);
     }
 
-    // Verifies that schedule_to_self delivers a message to the actor after the
-    // given delay without requiring .await in handle().
     #[tokio::test]
     async fn test_schedule_to_self_delivers_after_delay() {
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
-
         let counter = Arc::new(AtomicUsize::new(0));
 
         #[derive(Debug)]
         struct TimerActor {
             counter: Arc<AtomicUsize>,
         }
-
         impl Actor for TimerActor {
             type Msg = TestMessage;
-
             fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 if msg.data == "start" {
-                    // schedule_to_self is sync — no .await
                     ctx.schedule_to_self(
                         std::time::Duration::from_millis(20),
                         TestMessage {
@@ -1391,17 +1355,14 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
+        let c = counter.clone();
         let actor_ref = system
             .spawn_actor(
                 "timer-actor",
-                TimerActor {
-                    counter: counter.clone(),
-                },
+                move || TimerActor { counter: c.clone() },
                 ActorProps::default(),
             )
             .unwrap();
-
         actor_ref
             .tell(
                 TestMessage {
@@ -1410,16 +1371,12 @@ mod tests {
                 None,
             )
             .unwrap();
-
-        // Before delay expires counter should still be zero.
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
         assert_eq!(
             counter.load(AOrdering::Relaxed),
             0,
             "tick must not arrive before delay"
         );
-
-        // After delay expires the tick message should have been delivered.
         tokio::time::sleep(tokio::time::Duration::from_millis(40)).await;
         assert_eq!(
             counter.load(AOrdering::Relaxed),
@@ -1428,21 +1385,17 @@ mod tests {
         );
     }
 
-    // schedule_once can target a different actor (cross-actor scheduling).
     #[tokio::test]
     async fn test_schedule_once_cross_actor() {
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
-
         let counter = Arc::new(AtomicUsize::new(0));
 
         #[derive(Debug)]
         struct SenderActor {
             target: ActorRef<TestMessage>,
         }
-
         impl Actor for SenderActor {
             type Msg = TestMessage;
-
             fn handle(&mut self, _msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 ctx.schedule_once(
                     std::time::Duration::from_millis(20),
@@ -1458,10 +1411,8 @@ mod tests {
         struct ReceiverActor {
             counter: Arc<AtomicUsize>,
         }
-
         impl Actor for ReceiverActor {
             type Msg = TestMessage;
-
             fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
                 self.counter.fetch_add(1, AOrdering::Relaxed);
             }
@@ -1470,23 +1421,19 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
+        let c = counter.clone();
         let receiver_ref = system
             .spawn_actor(
                 "receiver-actor",
-                ReceiverActor {
-                    counter: counter.clone(),
-                },
+                move || ReceiverActor { counter: c.clone() },
                 ActorProps::default(),
             )
             .unwrap();
-
+        let t = receiver_ref.clone();
         let sender_ref = system
             .spawn_actor(
                 "sender-actor",
-                SenderActor {
-                    target: receiver_ref,
-                },
+                move || SenderActor { target: t.clone() },
                 ActorProps::default(),
             )
             .unwrap();
@@ -1494,37 +1441,23 @@ mod tests {
         sender_ref
             .tell(TestMessage { data: "go".into() }, None)
             .unwrap();
-
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-        assert_eq!(
-            counter.load(AOrdering::Relaxed),
-            0,
-            "must not arrive before delay"
-        );
-
+        assert_eq!(counter.load(AOrdering::Relaxed), 0);
         tokio::time::sleep(tokio::time::Duration::from_millis(40)).await;
-        assert_eq!(
-            counter.load(AOrdering::Relaxed),
-            1,
-            "must arrive after delay"
-        );
+        assert_eq!(counter.load(AOrdering::Relaxed), 1);
     }
 
-    // Multiple schedule_to_self calls from one handle invocation fire independently.
     #[tokio::test]
     async fn test_schedule_to_self_multiple_timers() {
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
-
         let counter = Arc::new(AtomicUsize::new(0));
 
         #[derive(Debug)]
         struct MultiTimerActor {
             counter: Arc<AtomicUsize>,
         }
-
         impl Actor for MultiTimerActor {
             type Msg = TestMessage;
-
             fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 if msg.data == "start" {
                     ctx.schedule_to_self(
@@ -1548,17 +1481,14 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
+        let c = counter.clone();
         let actor_ref = system
             .spawn_actor(
                 "multi-timer-actor",
-                MultiTimerActor {
-                    counter: counter.clone(),
-                },
+                move || MultiTimerActor { counter: c.clone() },
                 ActorProps::default(),
             )
             .unwrap();
-
         actor_ref
             .tell(
                 TestMessage {
@@ -1567,53 +1497,31 @@ mod tests {
                 None,
             )
             .unwrap();
-
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        assert_eq!(
-            counter.load(AOrdering::Relaxed),
-            0,
-            "neither tick should have fired yet"
-        );
-
+        assert_eq!(counter.load(AOrdering::Relaxed), 0);
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        assert_eq!(
-            counter.load(AOrdering::Relaxed),
-            1,
-            "first tick should have fired"
-        );
-
+        assert_eq!(counter.load(AOrdering::Relaxed), 1);
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
-        assert_eq!(
-            counter.load(AOrdering::Relaxed),
-            2,
-            "both ticks should have fired"
-        );
+        assert_eq!(counter.load(AOrdering::Relaxed), 2);
     }
 
-    // A self-stopping child must be removed from the parent's children map,
-    // not just from actor_storage. Regression test for the memory leak where
-    // dead Box<dyn AnyActorRef> entries accumulated in the parent's children map.
     #[tokio::test]
     async fn test_self_stopping_child_removed_from_parent_children_map() {
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
-
-        let reported_count = Arc::new(AtomicUsize::new(99)); // 99 = unreported sentinel
+        let reported_count = Arc::new(AtomicUsize::new(99));
 
         #[derive(Debug)]
         struct ParentActor {
             child: Option<ActorRef<TestMessage>>,
             reported_count: Arc<AtomicUsize>,
         }
-
         impl Actor for ParentActor {
             type Msg = TestMessage;
-
             fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
-                let child_ref = ctx.spawn_child("child", SelfStoppingActor, None)?;
+                let child_ref = ctx.spawn_child("child", SelfStoppingActor::default, None)?;
                 self.child = Some(child_ref);
                 Ok(())
             }
-
             fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 match msg.data.as_str() {
                     "trigger" => {
@@ -1633,21 +1541,19 @@ mod tests {
         let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
             .await
             .unwrap();
-
+        let rc = reported_count.clone();
         let parent_ref = system
             .spawn_actor(
                 "parent",
-                ParentActor {
+                move || ParentActor {
                     child: None,
-                    reported_count: reported_count.clone(),
+                    reported_count: rc.clone(),
                 },
                 ActorProps::default(),
             )
             .unwrap();
 
         let child_addr = parent_ref.address().child("child").unwrap();
-
-        // Trigger stop_self() on the child via the parent.
         parent_ref
             .tell(
                 TestMessage {
@@ -1656,15 +1562,9 @@ mod tests {
                 None,
             )
             .unwrap();
-
-        // Wait for child to stop and ActorStopped to propagate to parent.
         tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
-        assert!(
-            !system.contains_actor(&child_addr),
-            "child must be removed from actor_storage after stop_self"
-        );
+        assert!(!system.contains_actor(&child_addr));
 
-        // Ask parent to report its current children count.
         parent_ref
             .tell(
                 TestMessage {
@@ -1674,11 +1574,281 @@ mod tests {
             )
             .unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
-
         assert_eq!(
             reported_count.load(AOrdering::Relaxed),
             0,
-            "parent's children map must be empty after child self-stops (memory leak fix)"
+            "parent's children map must be empty after child self-stops"
+        );
+    }
+
+    // ── Supervision tests ────────────────────────────────────────────────────
+
+    /// An actor that panics on the first message it receives, then
+    /// behaves normally. Used to test supervised restart.
+    #[derive(Debug)]
+    struct PanicOnceActor {
+        panicked: Arc<AtomicBool>,
+        handled: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    use std::sync::atomic::AtomicBool;
+    impl Actor for PanicOnceActor {
+        type Msg = TestMessage;
+        fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+            if !self.panicked.swap(true, Ordering::SeqCst) {
+                panic!("intentional test panic");
+            }
+            self.handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restart_after_panic() {
+        use std::sync::atomic::AtomicUsize;
+
+        let panicked = Arc::new(AtomicBool::new(false));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let panicked2 = panicked.clone();
+        let handled2 = handled.clone();
+
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let props = ActorProps::new()
+            .with_restart(3, 60)
+            .with_backoff(10, 100, 0.0);
+
+        let actor_ref = system
+            .spawn_actor(
+                "panic-once",
+                move || PanicOnceActor {
+                    panicked: panicked2.clone(),
+                    handled: handled2.clone(),
+                },
+                props,
+            )
+            .unwrap();
+
+        // First message → panic → restart
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "boom".into(),
+                },
+                None,
+            )
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Second message → handled normally after restart
+        actor_ref
+            .tell(TestMessage { data: "ok".into() }, None)
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        assert!(
+            panicked.load(Ordering::SeqCst),
+            "actor should have panicked"
+        );
+        assert_eq!(
+            handled.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "second message must be handled after restart"
+        );
+        assert!(
+            system.contains_actor(actor_ref.address()),
+            "actor must still be live after restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_strategy_removes_actor_on_panic() {
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        #[derive(Debug, Default)]
+        struct AlwaysPanicsActor;
+        impl Actor for AlwaysPanicsActor {
+            type Msg = TestMessage;
+            fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+                panic!("always panics");
+            }
+        }
+
+        // Default props → Stop strategy
+        let actor_ref = system
+            .spawn_actor(
+                "always-panics",
+                AlwaysPanicsActor::default,
+                ActorProps::default(),
+            )
+            .unwrap();
+
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "boom".into(),
+                },
+                None,
+            )
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        assert!(
+            !system.contains_actor(actor_ref.address()),
+            "actor with Stop strategy must be removed after panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_restarts_removes_actor() {
+        use std::sync::atomic::AtomicUsize;
+
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let restart_count = Arc::new(AtomicUsize::new(0));
+        let rc = restart_count.clone();
+
+        #[derive(Debug)]
+        struct AlwaysPanicsActor {
+            count: Arc<AtomicUsize>,
+        }
+        impl Actor for AlwaysPanicsActor {
+            type Msg = TestMessage;
+            fn pre_start(&mut self, _ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+                self.count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+                panic!("always panics");
+            }
+        }
+
+        let props = ActorProps::new()
+            .with_restart(2, 60)
+            .with_backoff(10, 50, 0.0);
+        let actor_ref = system
+            .spawn_actor(
+                "exhausted",
+                move || AlwaysPanicsActor { count: rc.clone() },
+                props,
+            )
+            .unwrap();
+
+        // The receiver persists across restarts, so pre-loading 3 messages ensures
+        // each incarnation (initial + 2 restarts) gets one message to panic on.
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "boom-1".into(),
+                },
+                None,
+            )
+            .unwrap();
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "boom-2".into(),
+                },
+                None,
+            )
+            .unwrap();
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "boom-3".into(),
+                },
+                None,
+            )
+            .unwrap();
+        // Wait long enough for 2 restarts + backoffs (2 × 10ms + buffer)
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        assert!(
+            !system.contains_actor(actor_ref.address()),
+            "actor must be removed after exhausting restarts"
+        );
+        // pre_start called: 1 initial + 2 restarts = 3
+        assert_eq!(restart_count.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn test_on_child_failed_called_when_child_panics() {
+        use std::sync::atomic::AtomicUsize;
+
+        let notified = Arc::new(AtomicUsize::new(0));
+        let notified2 = notified.clone();
+
+        #[derive(Debug, Default)]
+        struct PanicChildActor;
+        impl Actor for PanicChildActor {
+            type Msg = TestMessage;
+            fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+                panic!("child panic");
+            }
+        }
+
+        #[derive(Debug)]
+        struct SupervisorActor {
+            notified: Arc<AtomicUsize>,
+            child: Option<ActorRef<TestMessage>>,
+        }
+        impl Actor for SupervisorActor {
+            type Msg = TestMessage;
+            fn pre_start(&mut self, ctx: &ActorContext<TestMessage>) -> Result<(), ActorError> {
+                let child = ctx.spawn_child("child", PanicChildActor::default, None)?;
+                self.child = Some(child);
+                Ok(())
+            }
+            fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
+                if let Some(child) = &self.child {
+                    let _ = child.tell(
+                        TestMessage {
+                            data: "boom".into(),
+                        },
+                        None,
+                    );
+                }
+            }
+            fn on_child_failed(
+                &mut self,
+                _child: &ActorAddress,
+                _error: &ActorError,
+                _ctx: &ActorContext<TestMessage>,
+            ) -> SupervisionStrategy {
+                self.notified
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                SupervisionStrategy::Stop
+            }
+        }
+
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let parent_ref = system
+            .spawn_actor(
+                "supervisor",
+                move || SupervisorActor {
+                    notified: notified2.clone(),
+                    child: None,
+                },
+                ActorProps::default(),
+            )
+            .unwrap();
+
+        parent_ref
+            .tell(TestMessage { data: "go".into() }, None)
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            notified.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "on_child_failed must be called exactly once when child panics"
         );
     }
 }

@@ -26,4 +26,9 @@ pub enum ActorError {
 
     #[error("Network error: {0}")]
     NetworkError(String),
+
+    /// The actor panicked during `handle`, `pre_start`, or `post_stop`.
+    /// The panic message (if any) is captured and stored here.
+    #[error("Actor panicked: {0}")]
+    Panic(String),
 }

@@ -107,10 +107,13 @@ async fn main() {
 
     let mut domains = Vec::new();
     for i in 0..N_DOMAINS {
+        let done = done.clone();
+        let total_latency_us = total_latency_us.clone();
+        let notify = notify.clone();
         let r = system
             .spawn_actor(
                 &format!("domain-{i}"),
-                DomainActor::new(done.clone(), total_latency_us.clone(), notify.clone()),
+                move || DomainActor::new(done.clone(), total_latency_us.clone(), notify.clone()),
                 ActorProps::default(),
             )
             .unwrap();

@@ -30,98 +30,74 @@ pub trait Actor: Send + Sync + std::fmt::Debug + 'static {
         Ok(())
     }
 
-    /// Called when the actor encounters an error. Return true to restart, false to stop.
-    fn on_error(&mut self, error: &ActorError, _ctx: &ActorContext<Self::Msg>) -> bool {
-        tracing::error!("Actor error: {}", error);
-        false
+    /// Called by the parent supervisor when a child actor fails.
+    ///
+    /// The parent decides how to handle the failure by returning a
+    /// [`SupervisionStrategy`]. The default is `Stop` — failed children are
+    /// stopped and not restarted unless the parent explicitly overrides this.
+    ///
+    /// ## Strategies
+    /// - `Stop` — terminate the child permanently.
+    /// - `Restart` — recreate the child using its factory closure and resume processing.
+    /// - `Escalate` — propagate the failure up to *this* actor's own parent.
+    /// - `Resume` — keep the existing (potentially dirty) child instance and let
+    ///   it continue processing. Use only when you are sure the failure left no
+    ///   inconsistent state. See aktor-bsk for the planned future overhaul.
+    ///
+    /// ## Ownership
+    ///
+    /// Supervision is the parent's responsibility, not the child's. Children
+    /// do not implement `on_error` — they simply fail and report upward via the
+    /// `ChildFailed` system message. This mirrors Akka Typed's model.
+    fn on_child_failed(
+        &mut self,
+        _child: &crate::ActorAddress,
+        _error: &ActorError,
+        _ctx: &ActorContext<Self::Msg>,
+    ) -> SupervisionStrategy {
+        SupervisionStrategy::Stop
     }
 }
 
-/// Supervision strategy for handling actor failures
+/// Supervision strategy returned by [`Actor::on_child_failed`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum SupervisionStrategy {
-    /// Restart the failed actor
+    /// Restart the failed actor using its factory closure.
     Restart,
-    /// Stop the failed actor
+    /// Stop the failed actor permanently.
     Stop,
-    /// Escalate the failure to the parent supervisor
+    /// Escalate the failure to this actor's own parent.
     Escalate,
-    /// Resume the actor (ignore the failure)
+    /// Resume the actor with the same (potentially dirty) instance.
+    /// See aktor-bsk for the planned future overhaul of this variant.
     Resume,
 }
 
-/// Factory trait for actors that can be created with arguments
-pub trait ActorFactoryArgs<Args: Send + 'static>: Actor + Sized {
-    /// Create actor with arguments
-    fn create_args(args: Args) -> Self;
-}
-
-/// Simple actor factory for actors with Default implementation
-#[derive(Debug)]
-pub struct DefaultActorFactory<A> {
-    _phantom: std::marker::PhantomData<A>,
-}
-
-impl<A> DefaultActorFactory<A> {
-    pub fn new() -> Self {
-        Self {
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    pub fn create_actor(&self) -> A
-    where
-        A: Actor + Default,
-    {
-        A::default()
-    }
-}
-
-impl<A> Default for DefaultActorFactory<A> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Args-based actor factory
-#[derive(Debug, Default)]
-pub struct ArgsActorFactory<A, Args> {
-    _phantom_actor: std::marker::PhantomData<A>,
-    _phantom_args: std::marker::PhantomData<Args>,
-}
-
-impl<A, Args> ArgsActorFactory<A, Args> {
-    pub fn new() -> Self {
-        Self {
-            _phantom_actor: std::marker::PhantomData,
-            _phantom_args: std::marker::PhantomData,
-        }
-    }
-
-    pub fn create_actor(&self, args: Args) -> A
-    where
-        A: ActorFactoryArgs<Args>,
-        Args: Send + 'static,
-    {
-        A::create_args(args)
-    }
-}
-
-/// Actor props for configuring actor creation
+/// Actor props for configuring actor creation and supervision.
 #[derive(Debug, Clone)]
 pub struct ActorProps {
-    /// Supervision strategy for this actor
+    /// Supervision strategy applied to *this* actor by its parent.
     pub supervision_strategy: SupervisionStrategy,
-    /// Whether this actor should be restarted on failure
-    pub restart_on_failure: bool,
-    /// Maximum number of restart attempts
+    /// Maximum number of restart attempts within `restart_window_secs`.
     pub max_restarts: u32,
-    /// Time window for restart counting (in seconds)
+    /// Window (seconds) over which `max_restarts` is counted.
+    /// If the actor runs longer than this without failing, the restart
+    /// counter resets to zero.
     pub restart_window_secs: u64,
-    /// Mailbox capacity for this actor. None means use ActorSystemConfig::default_mailbox_size.
+    /// Mailbox capacity. `None` means use `ActorSystemConfig::default_mailbox_size`.
     pub mailbox_size: Option<usize>,
-    /// Dispatcher name for thread pool assignment
+    /// Dispatcher name for thread pool assignment.
     pub dispatcher: Option<String>,
+    // ------------------------------------------------------------------
+    // Exponential backoff (used by the Restart strategy)
+    // ------------------------------------------------------------------
+    /// Initial backoff before the first restart attempt (milliseconds).
+    pub backoff_base_ms: u64,
+    /// Maximum backoff cap (milliseconds).
+    pub backoff_max_ms: u64,
+    /// Jitter factor in [0.0, 1.0]. The actual delay is multiplied by
+    /// `1.0 + jitter * rand(-1, 1)` so successive retries spread out.
+    pub backoff_jitter: f64,
 }
 
 impl ActorProps {
@@ -144,10 +120,19 @@ impl ActorProps {
         self
     }
 
+    /// Configure restart limits (implies `SupervisionStrategy::Restart`).
     pub fn with_restart(mut self, max_restarts: u32, window_secs: u64) -> Self {
-        self.restart_on_failure = true;
+        self.supervision_strategy = SupervisionStrategy::Restart;
         self.max_restarts = max_restarts;
         self.restart_window_secs = window_secs;
+        self
+    }
+
+    /// Override the exponential backoff parameters.
+    pub fn with_backoff(mut self, base_ms: u64, max_ms: u64, jitter: f64) -> Self {
+        self.backoff_base_ms = base_ms;
+        self.backoff_max_ms = max_ms;
+        self.backoff_jitter = jitter.clamp(0.0, 1.0);
         self
     }
 }
@@ -156,11 +141,13 @@ impl Default for ActorProps {
     fn default() -> Self {
         Self {
             supervision_strategy: SupervisionStrategy::Stop,
-            restart_on_failure: false,
             max_restarts: 3,
             restart_window_secs: 60,
             mailbox_size: None,
             dispatcher: None,
+            backoff_base_ms: 100,
+            backoff_max_ms: 60_000,
+            backoff_jitter: 0.2,
         }
     }
 }
@@ -175,35 +162,34 @@ mod tests {
         content: String,
     }
 
-    impl Message for TestMessage {
+    impl crate::Message for TestMessage {
         fn type_id(&self) -> &'static str {
             "TestMessage"
         }
     }
 
     #[derive(Debug)]
-    struct TestActor {
-        received_messages: Vec<String>,
-    }
-
-    impl Default for TestActor {
-        fn default() -> Self {
-            Self {
-                received_messages: Vec::new(),
-            }
-        }
-    }
+    struct TestActor;
 
     impl Actor for TestActor {
         type Msg = TestMessage;
 
-        fn handle(&mut self, msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
-            self.received_messages.push(msg.content);
-        }
+        fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {}
     }
 
     #[tokio::test]
-    async fn test_actor_props() {
+    async fn test_actor_props_defaults() {
+        let props = ActorProps::default();
+        assert_eq!(props.supervision_strategy, SupervisionStrategy::Stop);
+        assert_eq!(props.max_restarts, 3);
+        assert_eq!(props.restart_window_secs, 60);
+        assert_eq!(props.backoff_base_ms, 100);
+        assert_eq!(props.backoff_max_ms, 60_000);
+        assert!((props.backoff_jitter - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_with_restart_sets_strategy() {
         let props = ActorProps::new()
             .with_supervision(SupervisionStrategy::Restart)
             .with_restart(5, 120);
@@ -211,18 +197,13 @@ mod tests {
         assert_eq!(props.supervision_strategy, SupervisionStrategy::Restart);
         assert_eq!(props.max_restarts, 5);
         assert_eq!(props.restart_window_secs, 120);
-        assert!(props.restart_on_failure);
     }
 
     #[tokio::test]
-    async fn test_test_actor_functionality() {
-        let actor = TestActor::default();
-        let message = TestMessage {
-            content: "test message".to_string(),
-        };
-
-        assert_eq!(actor.received_messages.len(), 0);
-        assert_eq!(message.content, "test message");
-        assert_eq!(Message::type_id(&message), "TestMessage");
+    async fn test_with_backoff() {
+        let props = ActorProps::new().with_backoff(200, 30_000, 0.5);
+        assert_eq!(props.backoff_base_ms, 200);
+        assert_eq!(props.backoff_max_ms, 30_000);
+        assert!((props.backoff_jitter - 0.5).abs() < f64::EPSILON);
     }
 }
