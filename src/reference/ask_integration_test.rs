@@ -93,7 +93,7 @@ mod tests {
             .await
             .unwrap();
         let actor_ref = system
-            .spawn_actor("echo", EchoActor::default(), ActorProps::default())
+            .spawn_actor("echo", EchoActor::default, ActorProps::default())
             .unwrap();
         sleep(Duration::from_millis(10)).await;
         (system, actor_ref)
@@ -219,7 +219,7 @@ mod tests {
             .await
             .unwrap();
         let actor_ref = system
-            .spawn_actor("slow", SlowActor::default(), ActorProps::default())
+            .spawn_actor("slow", SlowActor::default, ActorProps::default())
             .unwrap();
         sleep(Duration::from_millis(10)).await;
 
@@ -247,7 +247,7 @@ mod tests {
             .await
             .unwrap();
         let actor_ref = system
-            .spawn_actor("doomed", SlowActor::default(), ActorProps::default())
+            .spawn_actor("doomed", SlowActor::default, ActorProps::default())
             .unwrap();
         sleep(Duration::from_millis(10)).await;
 

@@ -234,19 +234,46 @@ impl ActorTestKit {
         &self.system
     }
 
-    /// Spawn an actor in the test environment
+    /// Spawn an actor in the test environment.
+    ///
+    /// Accepts an actor instance. Test actors are not expected to restart, so the
+    /// instance is wrapped in a one-shot factory internally. If the actor somehow
+    /// restarts it will panic with a clear message — use `ActorSystem::spawn_actor`
+    /// with a closure directly for restart-capable actors.
     pub fn spawn<A: Actor>(&self, actor: A, name: &str) -> Result<ActorRef<A::Msg>, ActorError> {
-        self.system.spawn_actor(name, actor, ActorProps::default())
+        let cell = std::sync::Mutex::new(Some(actor));
+        self.system.spawn_actor(
+            name,
+            move || {
+                cell.lock()
+                    .unwrap()
+                    .take()
+                    .expect("test actor restarted — use a factory closure for restart support")
+            },
+            ActorProps::default(),
+        )
     }
 
-    /// Spawn an actor with custom props
+    /// Spawn an actor with custom props.
+    ///
+    /// Same instance-wrapping semantics as `spawn` — one-shot, no restarts.
     pub fn spawn_with_props<A: Actor>(
         &self,
         actor: A,
         name: &str,
         props: ActorProps,
     ) -> Result<ActorRef<A::Msg>, ActorError> {
-        self.system.spawn_actor(name, actor, props)
+        let cell = std::sync::Mutex::new(Some(actor));
+        self.system.spawn_actor(
+            name,
+            move || {
+                cell.lock()
+                    .unwrap()
+                    .take()
+                    .expect("test actor restarted — use a factory closure for restart support")
+            },
+            props,
+        )
     }
 
     /// Create a test probe for capturing messages of type M
@@ -254,14 +281,21 @@ impl ActorTestKit {
         let probe_id = Uuid::new_v4();
         let messages = Arc::new(Mutex::new(VecDeque::new()));
 
-        // Create probe actor
-        let probe_actor = TestProbeActor {
-            messages: messages.clone(),
-            message_type: std::marker::PhantomData::<M>,
-        };
-
+        // The probe actor shares the same `messages` queue across restarts so
+        // probe assertions always see all captured messages regardless of actor
+        // incarnation. Two clones are required: one for the closure to own,
+        // one produced per-call for each actor instance.
+        let factory_msgs = messages.clone();
         let actor_ref = self
-            .spawn(probe_actor, &format!("test-probe-{}", probe_id))
+            .system
+            .spawn_actor(
+                &format!("test-probe-{}", probe_id),
+                move || TestProbeActor {
+                    messages: factory_msgs.clone(),
+                    message_type: std::marker::PhantomData::<M>,
+                },
+                ActorProps::default(),
+            )
             .expect("Failed to spawn test probe actor");
 
         let probe = Arc::new(TestProbe {

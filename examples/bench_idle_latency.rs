@@ -123,7 +123,11 @@ async fn main() {
     // Spawn idle actors — they will never receive a message.
     for i in 0..N_IDLE {
         system
-            .spawn_actor(&format!("idle-{i}"), IdleActor, ActorProps::default())
+            .spawn_actor(
+                &format!("idle-{i}"),
+                IdleActor::default,
+                ActorProps::default(),
+            )
             .unwrap();
     }
 
@@ -131,10 +135,14 @@ async fn main() {
 
     // Spawn active ping actors.
     for i in 0..N_ACTIVE {
+        let total_jitter_us = total_jitter_us.clone();
+        let max_jitter_us = max_jitter_us.clone();
+        let done_count = done_count.clone();
+        let notify = notify.clone();
         system
             .spawn_actor(
                 &format!("ping-{i}"),
-                PingActor {
+                move || PingActor {
                     deadline: Instant::now(),
                     ping_count: 0,
                     max_pings,

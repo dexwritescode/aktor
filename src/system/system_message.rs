@@ -16,4 +16,12 @@ pub enum SystemMessage {
     /// Sent by a stopping actor to its parent so the parent can remove the
     /// child from its children map. Also the hook for future death-watch.
     ActorStopped { address: ActorAddress },
+    /// Sent by a failed child runner to its parent so the parent's
+    /// `on_child_failed` hook can decide the supervision strategy.
+    ChildFailed {
+        /// Address of the actor that failed.
+        child: ActorAddress,
+        /// Human-readable description of the error (formatted from `ActorError`).
+        error: String,
+    },
 }

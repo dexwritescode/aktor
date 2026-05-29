@@ -120,13 +120,9 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<(), Box<dyn std::error
 
     // Spawn all actors first
     for i in 0..config.actor_count {
-        let actor = BenchActor::new(
-            // i
-        );
-
         let actor_ref = system.spawn_actor(
             &format!("bench-actor-{}", i),
-            actor,
+            BenchActor::new,
             ActorProps::new().with_mailbox_size(10000),
         )?;
 

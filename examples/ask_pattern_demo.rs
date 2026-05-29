@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Ask Pattern Demo (ReplyTo<R>) ===\n");
 
     let system = ActorSystem::new(ActorSystemConfig::default()).await?;
-    let actor_ref = system.spawn_actor("status", StatusActor::default(), ActorProps::default())?;
+    let actor_ref = system.spawn_actor("status", StatusActor::default, ActorProps::default())?;
     sleep(Duration::from_millis(50)).await;
 
     // 1. Basic ask via ActorRef::ask
@@ -157,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // intentionally no reply
         }
     }
-    let silent_ref = system2.spawn_actor("silent", SilentActor, ActorProps::default())?;
+    let silent_ref = system2.spawn_actor("silent", || SilentActor, ActorProps::default())?;
     sleep(Duration::from_millis(10)).await;
     match silent_ref
         .ask(

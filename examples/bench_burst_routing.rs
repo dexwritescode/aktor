@@ -80,10 +80,13 @@ async fn main() {
 
     let mut workers = Vec::new();
     for i in 0..N_WORKERS {
+        let done = done.clone();
+        let total_latency_us = total_latency_us.clone();
+        let notify = notify.clone();
         let r = system
             .spawn_actor(
                 &format!("worker-{i}"),
-                WorkerActor {
+                move || WorkerActor {
                     done: done.clone(),
                     total_latency_us: total_latency_us.clone(),
                     notify: notify.clone(),
@@ -94,11 +97,12 @@ async fn main() {
         workers.push(r);
     }
 
+    let workers_ref = workers.clone();
     let router = system
         .spawn_actor(
             "router",
-            RouterActor {
-                workers: workers.clone(),
+            move || RouterActor {
+                workers: workers_ref.clone(),
                 cursor: 0,
             },
             ActorProps::new().with_mailbox_size(N_MESSAGES as usize),

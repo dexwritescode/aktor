@@ -98,11 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     system.register_extension(HttpClientExtension::with_timeout(Duration::from_secs(10)));
 
     // Spawn the fetch actor.
+    let notify_f = notify.clone();
+    let success_f = success.clone();
     let actor_ref = system.spawn_actor(
         "fetcher",
-        FetchActor {
-            notify: notify.clone(),
-            success: success.clone(),
+        move || FetchActor {
+            notify: notify_f.clone(),
+            success: success_f.clone(),
         },
         ActorProps::default(),
     )?;

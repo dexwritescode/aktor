@@ -109,6 +109,9 @@ pub enum ActorState {
     Stopped,
     /// Panicked or returned an error from `handle` / `pre_start`.
     Failed(String),
+    /// Waiting before a supervised restart attempt (exponential backoff).
+    /// Contains the attempt number (1-based) for observability.
+    BackingOff(u32),
 }
 
 // ------------------------------------------------------------------

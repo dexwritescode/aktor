@@ -85,11 +85,15 @@ impl DomainActor {
             return;
         };
         self.in_flight = true;
-        let crawler = CrawlerActor {
-            reply_to: ctx.actor_ref().clone(),
-        };
+        let reply_to = ctx.actor_ref().clone();
         let name = format!("crawler-{}", uuid::Uuid::new_v4().simple());
-        if let Ok(crawler_ref) = ctx.spawn_child(&name, crawler, None) {
+        if let Ok(crawler_ref) = ctx.spawn_child(
+            &name,
+            move || CrawlerActor {
+                reply_to: reply_to.clone(),
+            },
+            None,
+        ) {
             let _ = crawler_ref.tell(Msg::FetchUrl { url, sent_at }, None);
         }
     }
@@ -151,13 +155,18 @@ impl FrontierActor {
     fn route(&mut self, url: String, sent_at: Instant, ctx: &ActorContext<Msg>) {
         let domain = Self::domain_of(&url);
         if !self.domains.contains_key(&domain) {
-            let actor = DomainActor {
-                domain: domain.clone(),
-                queue: VecDeque::new(),
-                in_flight: false,
-                frontier: ctx.actor_ref().clone(),
-            };
-            if let Ok(r) = ctx.spawn_child(&domain, actor, None) {
+            let domain_name = domain.clone();
+            let frontier_ref = ctx.actor_ref().clone();
+            if let Ok(r) = ctx.spawn_child(
+                &domain,
+                move || DomainActor {
+                    domain: domain_name.clone(),
+                    queue: VecDeque::new(),
+                    in_flight: false,
+                    frontier: frontier_ref.clone(),
+                },
+                None,
+            ) {
                 self.domains.insert(domain.clone(), r);
             }
         }
@@ -210,17 +219,20 @@ async fn main() {
         .await
         .unwrap();
 
+    let done_f = done.clone();
+    let total_latency_us_f = total_latency_us.clone();
+    let notify_f = notify.clone();
     let frontier = system
         .spawn_actor(
             "frontier",
-            FrontierActor {
+            move || FrontierActor {
                 seen: HashSet::new(),
                 domains: HashMap::new(),
                 crawled: 0,
                 total: TOTAL_SEED_URLS as u64,
-                done: done.clone(),
-                total_latency_us: total_latency_us.clone(),
-                notify: notify.clone(),
+                done: done_f.clone(),
+                total_latency_us: total_latency_us_f.clone(),
+                notify: notify_f.clone(),
             },
             ActorProps::default(),
         )
