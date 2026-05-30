@@ -53,6 +53,167 @@ impl<M: Message> AnyActorRef for ActorRef<M> {
 }
 
 // ------------------------------------------------------------------
+// TimerScheduler — actor-bound timer management
+// ------------------------------------------------------------------
+
+type TimerMap = Arc<Mutex<Option<HashMap<String, tokio::task::AbortHandle>>>>;
+
+/// Actor-bound timer scheduler, accessible as `ctx.timers`.
+///
+/// All timers deliver messages to the owning actor's own mailbox.
+/// Every outstanding timer is automatically cancelled when the actor stops
+/// or restarts — no ghost messages can ever reach a dead or restarted
+/// incarnation.
+///
+/// # Key semantics
+///
+/// Each timer is identified by a caller-supplied `key`. Starting a new timer
+/// with an existing key silently cancels the old one first, so you can safely
+/// "reset" a timer by re-issuing the same call. Keys appear in logs and make
+/// intent explicit.
+pub struct TimerScheduler<M: Message> {
+    actor_ref: ActorRef<M>,
+    inner: TimerMap,
+}
+
+impl<M: Message> std::fmt::Debug for TimerScheduler<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self.inner.lock().unwrap().as_ref().map_or(0, |m| m.len());
+        f.debug_struct("TimerScheduler")
+            .field("active_timers", &count)
+            .finish()
+    }
+}
+
+impl<M: Message> TimerScheduler<M> {
+    fn new(actor_ref: ActorRef<M>) -> Self {
+        Self {
+            actor_ref,
+            inner: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Schedule a one-shot message to this actor's mailbox after `delay`.
+    ///
+    /// If a timer with `key` is already active it is cancelled first.
+    /// The entry removes itself from the map automatically after firing,
+    /// so there are no dead handles to clean up.
+    pub fn start_single_timer(&self, key: impl Into<String>, delay: std::time::Duration, msg: M) {
+        let key = key.into();
+        let inner = Arc::clone(&self.inner);
+
+        // Cancel + remove any existing timer with the same key.
+        {
+            let mut lock = inner.lock().unwrap();
+            if let Some(map) = lock.as_mut()
+                && let Some(old) = map.remove(&key)
+            {
+                old.abort();
+            }
+        }
+
+        let actor_ref = self.actor_ref.clone();
+        let key_for_task = key.clone();
+        let inner_for_task = Arc::clone(&inner);
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = actor_ref.tell(msg, None);
+            // Self-cleanup: remove the now-dead handle so the map stays lean.
+            if let Some(map) = inner_for_task.lock().unwrap().as_mut() {
+                map.remove(&key_for_task);
+            }
+        });
+
+        inner
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(key, handle.abort_handle());
+    }
+
+    /// Schedule a recurring message to this actor's mailbox.
+    ///
+    /// Fires after `initial_delay`, then every `interval` thereafter.
+    /// `make_msg` is called fresh each tick, so message fields can carry
+    /// live state (e.g. `Instant::now()`).
+    ///
+    /// If a timer with `key` is already active it is cancelled first.
+    /// The timer runs until [`cancel`][Self::cancel], [`cancel_all`][Self::cancel_all],
+    /// or actor stop/restart — whichever comes first.
+    pub fn start_timer_with_fixed_delay<F>(
+        &self,
+        key: impl Into<String>,
+        initial_delay: std::time::Duration,
+        interval: std::time::Duration,
+        make_msg: F,
+    ) where
+        F: Fn() -> M + Send + 'static,
+    {
+        let key = key.into();
+        let inner = Arc::clone(&self.inner);
+
+        // Cancel + remove any existing timer with the same key.
+        {
+            let mut lock = inner.lock().unwrap();
+            if let Some(map) = lock.as_mut()
+                && let Some(old) = map.remove(&key)
+            {
+                old.abort();
+            }
+        }
+
+        let actor_ref = self.actor_ref.clone();
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(initial_delay).await;
+            loop {
+                if actor_ref.tell(make_msg(), None).is_err() {
+                    // Mailbox gone — exit quietly; cancel_all cleans the entry.
+                    break;
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+
+        inner
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(key, handle.abort_handle());
+    }
+
+    /// Cancel the timer with the given key. No-op if the key is not active.
+    pub fn cancel(&self, key: &str) {
+        if let Some(map) = self.inner.lock().unwrap().as_mut()
+            && let Some(handle) = map.remove(key)
+        {
+            handle.abort();
+        }
+    }
+
+    /// Cancel all outstanding timers and reset the map to `None`.
+    ///
+    /// Called automatically before `post_stop` and before each restart.
+    pub fn cancel_all(&self) {
+        if let Some(map) = self.inner.lock().unwrap().take() {
+            for (_, handle) in map {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Returns `true` if a timer with `key` is currently scheduled.
+    pub fn is_timer_active(&self, key: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(key))
+    }
+}
+
+// ------------------------------------------------------------------
 // ActorContext<M>
 // ------------------------------------------------------------------
 
@@ -64,6 +225,10 @@ impl<M: Message> AnyActorRef for ActorRef<M> {
 pub struct ActorContext<M: Message> {
     pub actor_ref: ActorRef<M>,
     pub system: Arc<ActorSystem>,
+    /// Actor-bound timer scheduler. Use `ctx.timers.start_single_timer(...)` or
+    /// `ctx.timers.start_timer_with_fixed_delay(...)` to schedule messages back
+    /// to this actor. All timers are cancelled automatically on stop and restart.
+    pub timers: TimerScheduler<M>,
     /// Lazily initialised: `None` until the first `spawn_child` call.
     ///
     /// Stored inline (no extra heap allocation) inside the `Arc<ActorContext>`
@@ -82,6 +247,7 @@ impl<M: Message> ActorContext<M> {
         props: ActorProps,
     ) -> Self {
         Self {
+            timers: TimerScheduler::new(actor_ref.clone()),
             actor_ref,
             system,
             children: Mutex::new(None),
@@ -250,30 +416,6 @@ impl<M: Message> ActorContext<M> {
             m.remove(name);
         }
     }
-
-    /// Schedule a one-shot message delivery to `target` after `delay`.
-    pub fn schedule_once(
-        &self,
-        delay: std::time::Duration,
-        target: &ActorRef<M>,
-        message: M,
-    ) -> Uuid {
-        let target = target.clone();
-        let sender = Some(self.actor_ref.clone());
-        let task_id = Uuid::new_v4();
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            if let Err(e) = target.tell(message, sender) {
-                error!("Scheduled message delivery failed: {}", e);
-            }
-        });
-        task_id
-    }
-
-    /// Schedule a one-shot message back to this actor's own mailbox after `delay`.
-    pub fn schedule_to_self(&self, delay: std::time::Duration, message: M) -> Uuid {
-        self.schedule_once(delay, &self.actor_ref.clone(), message)
-    }
 }
 
 // ------------------------------------------------------------------
@@ -379,6 +521,11 @@ impl<A: Actor> ActorRunnerImpl<A> {
         'lifecycle: loop {
             // ── Startup ───────────────────────────────────────────────────────
             if is_restart {
+                // Cancel any timers left by the previous incarnation before
+                // creating a fresh actor. Prevents ghost messages from the old
+                // instance reaching the new one.
+                self.context.timers.cancel_all();
+
                 self.mailbox.update_state(ActorState::Starting).await;
                 self.actor = (self.factory)();
 
@@ -510,6 +657,9 @@ impl<A: Actor> ActorRunnerImpl<A> {
             };
 
             // ── Post-stop ─────────────────────────────────────────────────────
+            // Cancel all outstanding timers so no ghost messages arrive during
+            // or after actor cleanup.
+            self.context.timers.cancel_all();
             if let Err(e) = self.actor.post_stop(&self.context) {
                 error!("Actor {} post_stop failed: {}", self.address, e);
             }
@@ -1365,7 +1515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_schedule_to_self_delivers_after_delay() {
+    async fn test_single_timer_delivers_after_delay() {
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -1377,7 +1527,8 @@ mod tests {
             type Msg = TestMessage;
             fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 if msg.data == "start" {
-                    ctx.schedule_to_self(
+                    ctx.timers.start_single_timer(
+                        "tick",
                         std::time::Duration::from_millis(20),
                         TestMessage {
                             data: "tick".into(),
@@ -1423,35 +1574,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_schedule_once_cross_actor() {
+    async fn test_timer_key_replacement_cancels_old_timer() {
+        // Scheduling a second timer under the same key must cancel the first.
+        // Only one message should arrive — from the second (winning) timer.
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
         let counter = Arc::new(AtomicUsize::new(0));
 
         #[derive(Debug)]
-        struct SenderActor {
-            target: ActorRef<TestMessage>,
-        }
-        impl Actor for SenderActor {
-            type Msg = TestMessage;
-            fn handle(&mut self, _msg: TestMessage, ctx: &ActorContext<TestMessage>) {
-                ctx.schedule_once(
-                    std::time::Duration::from_millis(20),
-                    &self.target,
-                    TestMessage {
-                        data: "ping".into(),
-                    },
-                );
-            }
-        }
-
-        #[derive(Debug)]
-        struct ReceiverActor {
+        struct ReplacerActor {
             counter: Arc<AtomicUsize>,
         }
-        impl Actor for ReceiverActor {
+        impl Actor for ReplacerActor {
             type Msg = TestMessage;
-            fn handle(&mut self, _msg: TestMessage, _ctx: &ActorContext<TestMessage>) {
-                self.counter.fetch_add(1, AOrdering::Relaxed);
+            fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
+                if msg.data == "start" {
+                    // First timer fires at 20 ms — immediately replaced.
+                    ctx.timers.start_single_timer(
+                        "debounce",
+                        std::time::Duration::from_millis(20),
+                        TestMessage {
+                            data: "tick".into(),
+                        },
+                    );
+                    // Second call with the same key cancels the first; fires at 60 ms.
+                    ctx.timers.start_single_timer(
+                        "debounce",
+                        std::time::Duration::from_millis(60),
+                        TestMessage {
+                            data: "tick".into(),
+                        },
+                    );
+                } else if msg.data == "tick" {
+                    self.counter.fetch_add(1, AOrdering::Relaxed);
+                }
             }
         }
 
@@ -1459,33 +1614,41 @@ mod tests {
             .await
             .unwrap();
         let c = counter.clone();
-        let receiver_ref = system
+        let actor_ref = system
             .spawn_actor(
-                "receiver-actor",
-                move || ReceiverActor { counter: c.clone() },
-                ActorProps::default(),
-            )
-            .unwrap();
-        let t = receiver_ref.clone();
-        let sender_ref = system
-            .spawn_actor(
-                "sender-actor",
-                move || SenderActor { target: t.clone() },
+                "replacer-actor",
+                move || ReplacerActor { counter: c.clone() },
                 ActorProps::default(),
             )
             .unwrap();
 
-        sender_ref
-            .tell(TestMessage { data: "go".into() }, None)
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "start".into(),
+                },
+                None,
+            )
             .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-        assert_eq!(counter.load(AOrdering::Relaxed), 0);
-        tokio::time::sleep(tokio::time::Duration::from_millis(40)).await;
-        assert_eq!(counter.load(AOrdering::Relaxed), 1);
+
+        // At 30 ms: first timer was cancelled before firing → counter still 0.
+        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            0,
+            "cancelled timer must not fire"
+        );
+        // At 80 ms: second (winning) timer has fired → counter == 1.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(AOrdering::Relaxed),
+            1,
+            "replacement timer must fire exactly once"
+        );
     }
 
     #[tokio::test]
-    async fn test_schedule_to_self_multiple_timers() {
+    async fn test_multiple_timers_with_distinct_keys() {
         use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -1497,13 +1660,16 @@ mod tests {
             type Msg = TestMessage;
             fn handle(&mut self, msg: TestMessage, ctx: &ActorContext<TestMessage>) {
                 if msg.data == "start" {
-                    ctx.schedule_to_self(
+                    // Two independent timers — distinct keys so neither cancels the other.
+                    ctx.timers.start_single_timer(
+                        "timer-a",
                         std::time::Duration::from_millis(20),
                         TestMessage {
                             data: "tick".into(),
                         },
                     );
-                    ctx.schedule_to_self(
+                    ctx.timers.start_single_timer(
+                        "timer-b",
                         std::time::Duration::from_millis(40),
                         TestMessage {
                             data: "tick".into(),
