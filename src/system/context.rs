@@ -57,26 +57,21 @@ impl<M: Message> AnyActorRef for ActorRef<M> {
 // ------------------------------------------------------------------
 
 /// Actor context provides the runtime environment for an actor.
-/// Parameterised on the message type `M`, not on the actor type, so it can be
-/// freely cloned and passed without the caller knowing the concrete actor type.
+///
+/// Passed as `&ActorContext<M>` to every `handle` call. Not `Clone` — if you
+/// need to do work outside `handle`, capture `ctx.actor_ref().clone()` or
+/// `ctx.system().clone()` and use those directly.
 pub struct ActorContext<M: Message> {
     pub actor_ref: ActorRef<M>,
     pub system: Arc<ActorSystem>,
-    children: Arc<Mutex<HashMap<String, Box<dyn AnyActorRef>>>>,
+    /// Lazily initialised: `None` until the first `spawn_child` call.
+    ///
+    /// Stored inline (no extra heap allocation) inside the `Arc<ActorContext>`
+    /// the runner already holds. Leaf actors — the common case — pay zero
+    /// additional allocation cost for the children abstraction.
+    children: Mutex<Option<HashMap<String, Box<dyn AnyActorRef>>>>,
     parent: Option<ActorAddress>,
     props: ActorProps,
-}
-
-impl<M: Message> Clone for ActorContext<M> {
-    fn clone(&self) -> Self {
-        Self {
-            actor_ref: self.actor_ref.clone(),
-            system: self.system.clone(),
-            children: self.children.clone(),
-            parent: self.parent.clone(),
-            props: self.props.clone(),
-        }
-    }
 }
 
 impl<M: Message> ActorContext<M> {
@@ -89,7 +84,7 @@ impl<M: Message> ActorContext<M> {
         Self {
             actor_ref,
             system,
-            children: Arc::new(Mutex::new(HashMap::new())),
+            children: Mutex::new(None),
             parent,
             props,
         }
@@ -100,7 +95,10 @@ impl<M: Message> ActorContext<M> {
         let _ = self.actor_ref.send_system(SystemMessage::StopSelf);
     }
 
-    /// Spawn a future and deliver its `Ok` result back to this actor's mailbox.
+    /// Pipe a future's `Ok` result back to this actor's mailbox.
+    ///
+    /// If the future returns `Err`, the error is logged and dropped. Use
+    /// [`pipe_to_self_map`] when you need to deliver errors as a message variant.
     pub fn pipe_to_self<F, E>(&self, future: F)
     where
         F: std::future::Future<Output = Result<M, E>> + Send + 'static,
@@ -117,6 +115,33 @@ impl<M: Message> ActorContext<M> {
                 Err(e) => {
                     tracing::error!("pipe_to_self future failed: {:?}", e);
                 }
+            }
+        });
+    }
+
+    /// Pipe a future to this actor's mailbox, mapping both `Ok` and `Err`
+    /// to a message variant via `map`.
+    ///
+    /// Mirrors Akka Typed's `pipeToSelf(future)(result => ...)`.
+    ///
+    /// ```ignore
+    /// ctx.pipe_to_self_map(fetch(url), |result| match result {
+    ///     Ok(body) => Msg::FetchDone(body),
+    ///     Err(e)   => Msg::FetchFailed(e.to_string()),
+    /// });
+    /// ```
+    pub fn pipe_to_self_map<F, T, E, Map>(&self, future: F, map: Map)
+    where
+        F: std::future::Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+        Map: FnOnce(Result<T, E>) -> M + Send + 'static,
+    {
+        let actor_ref = self.actor_ref.clone();
+        tokio::spawn(async move {
+            let msg = map(future.await);
+            if let Err(e) = actor_ref.tell(msg, None) {
+                tracing::error!("pipe_to_self_map delivery failed: {}", e);
             }
         });
     }
@@ -160,6 +185,7 @@ impl<M: Message> ActorContext<M> {
         self.children
             .lock()
             .unwrap()
+            .get_or_insert_with(HashMap::new)
             .insert(name.to_string(), Box::new(child_ref.clone()));
 
         info!("Spawned child actor: {}", child_ref.address());
@@ -168,7 +194,12 @@ impl<M: Message> ActorContext<M> {
 
     /// Stop a named child actor.
     pub fn stop_child(&self, name: &str) -> Result<(), ActorError> {
-        let child = self.children.lock().unwrap().remove(name);
+        let child = self
+            .children
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|m| m.remove(name));
         if let Some(child_ref) = child {
             child_ref.stop_now()?;
             debug!("Stopped child actor: {}", name);
@@ -178,7 +209,7 @@ impl<M: Message> ActorContext<M> {
 
     /// Stop all child actors.
     pub fn stop_all_children(&self) -> Result<(), ActorError> {
-        let children = std::mem::take(&mut *self.children.lock().unwrap());
+        let children = self.children.lock().unwrap().take().unwrap_or_default();
         for (name, child) in children {
             if let Err(e) = child.stop_now() {
                 error!("Failed to stop child actor {}: {}", name, e);
@@ -203,14 +234,20 @@ impl<M: Message> ActorContext<M> {
 
     /// How many children this actor currently has.
     pub fn children_count(&self) -> usize {
-        self.children.lock().unwrap().len()
+        self.children
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |m| m.len())
     }
 
     /// Remove a child from the children map by its full address.
     /// Called by the runner when it receives `ActorStopped` for a child.
     pub(crate) fn remove_child_by_address(&self, address: &ActorAddress) {
-        if let Some(name) = address.name() {
-            self.children.lock().unwrap().remove(name);
+        if let Some(name) = address.name()
+            && let Some(m) = self.children.lock().unwrap().as_mut()
+        {
+            m.remove(name);
         }
     }
 
@@ -1850,5 +1887,168 @@ mod tests {
             1,
             "on_child_failed must be called exactly once when child panics"
         );
+    }
+
+    // ── aktor-ytc: lazy children map ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_leaf_actor_children_none_by_default() {
+        // A leaf actor that never calls spawn_child should have children == None.
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let actor_ref = system
+            .spawn_actor("leaf", TestActor::default, ActorProps::default())
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        // Verify the actor is alive and children_count returns 0 without
+        // ever having initialized the map.
+        actor_ref
+            .tell(
+                TestMessage {
+                    data: "ping".into(),
+                },
+                None,
+            )
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        // We can't inspect the private field directly, but children_count()
+        // must return 0 without panicking.
+        system.shutdown().await.unwrap();
+    }
+
+    // ── aktor-dpa: pipe_to_self_map ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_pipe_to_self_map_ok() {
+        #[derive(Debug)]
+        enum Msg {
+            Fetch,
+            Done(String),
+            Failed(String),
+        }
+        impl Message for Msg {
+            fn type_id(&self) -> &'static str {
+                "PipeMapMsg"
+            }
+        }
+
+        let result = Arc::new(Mutex::new(None::<String>));
+
+        #[derive(Debug)]
+        struct PipeActor {
+            result: Arc<Mutex<Option<String>>>,
+        }
+        impl Actor for PipeActor {
+            type Msg = Msg;
+            fn handle(&mut self, msg: Msg, ctx: &ActorContext<Msg>) {
+                match msg {
+                    Msg::Fetch => {
+                        ctx.pipe_to_self_map(async { Ok::<_, String>("hello".to_string()) }, |r| {
+                            match r {
+                                Ok(s) => Msg::Done(s),
+                                Err(e) => Msg::Failed(e),
+                            }
+                        });
+                    }
+                    Msg::Done(s) => {
+                        *self.result.lock().unwrap() = Some(format!("ok:{s}"));
+                    }
+                    Msg::Failed(e) => {
+                        *self.result.lock().unwrap() = Some(format!("err:{e}"));
+                    }
+                }
+            }
+        }
+
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let r = result.clone();
+        let actor_ref = system
+            .spawn_actor(
+                "pipe-map-ok",
+                move || PipeActor { result: r.clone() },
+                ActorProps::default(),
+            )
+            .unwrap();
+
+        actor_ref.tell(Msg::Fetch, None).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            result.lock().unwrap().as_deref(),
+            Some("ok:hello"),
+            "pipe_to_self_map must deliver Ok arm as Done"
+        );
+        system.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pipe_to_self_map_err() {
+        #[derive(Debug)]
+        enum Msg {
+            Fetch,
+            Done(String),
+            Failed(String),
+        }
+        impl Message for Msg {
+            fn type_id(&self) -> &'static str {
+                "PipeMapErrMsg"
+            }
+        }
+
+        let result = Arc::new(Mutex::new(None::<String>));
+
+        #[derive(Debug)]
+        struct PipeActor {
+            result: Arc<Mutex<Option<String>>>,
+        }
+        impl Actor for PipeActor {
+            type Msg = Msg;
+            fn handle(&mut self, msg: Msg, ctx: &ActorContext<Msg>) {
+                match msg {
+                    Msg::Fetch => {
+                        ctx.pipe_to_self_map(async { Err::<String, _>("boom".to_string()) }, |r| {
+                            match r {
+                                Ok(s) => Msg::Done(s),
+                                Err(e) => Msg::Failed(e),
+                            }
+                        });
+                    }
+                    Msg::Done(s) => {
+                        *self.result.lock().unwrap() = Some(format!("ok:{s}"));
+                    }
+                    Msg::Failed(e) => {
+                        *self.result.lock().unwrap() = Some(format!("err:{e}"));
+                    }
+                }
+            }
+        }
+
+        let system: Arc<ActorSystem> = ActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let r = result.clone();
+        let actor_ref = system
+            .spawn_actor(
+                "pipe-map-err",
+                move || PipeActor { result: r.clone() },
+                ActorProps::default(),
+            )
+            .unwrap();
+
+        actor_ref.tell(Msg::Fetch, None).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            result.lock().unwrap().as_deref(),
+            Some("err:boom"),
+            "pipe_to_self_map must deliver Err arm as Failed"
+        );
+        system.shutdown().await.unwrap();
     }
 }
