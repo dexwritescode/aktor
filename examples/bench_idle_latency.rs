@@ -61,9 +61,11 @@ impl Actor for PingActor {
 
     fn pre_start(&mut self, ctx: &ActorContext<Msg>) -> Result<(), ActorError> {
         self.deadline = Instant::now() + Duration::from_millis(PING_INTERVAL_MS);
-        ctx.schedule_to_self(
+        ctx.timers.start_timer_with_fixed_delay(
+            "ping",
             Duration::from_millis(PING_INTERVAL_MS),
-            Msg::Ping {
+            Duration::from_millis(PING_INTERVAL_MS),
+            || Msg::Ping {
                 scheduled_at: Instant::now(),
             },
         );
@@ -87,14 +89,8 @@ impl Actor for PingActor {
             }
         }
         self.ping_count += 1;
-        if self.ping_count < self.max_pings {
-            ctx.schedule_to_self(
-                Duration::from_millis(PING_INTERVAL_MS),
-                Msg::Ping {
-                    scheduled_at: Instant::now(),
-                },
-            );
-        } else {
+        if self.ping_count >= self.max_pings {
+            ctx.timers.cancel("ping");
             let prev = self.done_count.fetch_add(1, Ordering::Relaxed);
             if prev + 1 == N_ACTIVE {
                 self.notify.notify_one();
